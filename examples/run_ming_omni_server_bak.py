@@ -121,11 +121,6 @@ def parse_args() -> argparse.Namespace:
         default="ming-omni",
         help="Model name for /v1/models (default: ming-omni)",
     )
-    parser.add_argument(
-        "--enable-realtime",
-        action="store_true",
-        help="Mount the WebSocket /v1/realtime endpoint.",
-    )
 
     return parser.parse_args()
 
@@ -264,7 +259,6 @@ def _launch_text_server(args: argparse.Namespace) -> None:
         host=args.host,
         port=args.port,
         model_name=args.model_name,
-        enable_realtime=args.enable_realtime,
     )
 
 
