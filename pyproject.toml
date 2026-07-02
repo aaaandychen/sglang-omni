@@ -1,3 +1,4 @@
+
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
@@ -16,21 +17,20 @@ dependencies = [
     "numpy>=1.24.0",          # Array operations
     "pydantic>=2.0.0",        # Data validation and serialization
     "PyYAML>=6.0",            # YAML config parsing
-    "torch==2.11.0",          # PyTorch for tensor operations
-    "torchvision==0.26.0",    # torchvision for vision processor, pinned version based on torch 2.11.0
+    "torch==2.9.1",           # PyTorch for tensor operations (CUDA 12.9 compat)
+    "torchvision==0.24.1",    # torchvision for vision processor, pinned to torch 2.9.1
     "accelerate>=0.27.0",     # init_empty_weights for meta initialization
-    "transformers==5.6.0",   # HF models/tokenizers
+    "transformers>=5.3.0,<6.0",  # HF models/tokenizers (compat with sglang 0.5.10)
     "safetensors>=0.4.3",     # Direct weight loading
     "pillow>=10.0.0",         # Required by AutoImageProcessor
     "huggingface-hub>=0.36.0",# HF model downloads
     "datasets>=2.14.0",       # Arrow-based SeedTTS dataset loading
     "fastapi>=0.110.0",       # OpenAI-compatible API adapter
     "uvicorn>=0.23.0",        # ASGI server for FastAPI
-    "sglang==0.5.12.post1",
-    "flash-attn-4>=4.0.0b9,<4.0.0b16",  # Avoid cutlass-dsl>=4.5.2 conflict
-    "kernels>=0.14.0,<0.15",  # Match Transformers 5.6 / SGLang 0.5.12.post1 stack (ships kernels 0.14.1)
-    "nixl-cu13>=1.1.0",  # CUDA 13 relay wheel; the generic nixl/-cu12 wheel breaks on cu130
-    "mooncake-transfer-engine-cuda13>=0.3.10",  # CUDA 13 relay wheel; generic mooncake-transfer-engine pulls cu12 and breaks `import mooncake` on cu130
+    "sglang==0.5.10.post1",
+    "flash-attn-4>=4.0.0b9",  # sglang 0.5.10 dep; upper bound removed for compat
+    "nixl",  # CUDA 12.9 compat; meta-package auto-selects cu12 variant
+    "mooncake-transfer-engine>=0.3.10",  # CUDA 12.9 compat; generic wheel, no libcudart.so.13 needed
     "logger",
     "httpx",
     "xxhash>=3.0.0",
@@ -65,8 +65,8 @@ dependencies = [
     "omegaconf",
     "descript-audiotools",
     "descript-audio-codec",
-    "torchaudio==2.11.0",
-    "torchcodec==0.11.1",     # Matches sglang==0.5.12.post1 dependency
+    "torchaudio==2.9.1",
+    "torchcodec==0.9.1",
     # Gradio playground
     "gradio>=4.0.0",
     # Ming-Omni
