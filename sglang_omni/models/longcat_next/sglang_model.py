@@ -191,12 +191,16 @@ class LongcatNextTextForCausalLM(LongcatFlashForCausalLM):
             )
         )
 
+        _total_ckpt = 0
+        _skipped_mm = 0
         filtered: list[Tuple[str, torch.Tensor]] = []
         for name, weight in weights:
+            _total_ckpt += 1
             if any(
                 name.startswith(prefix)
                 for prefix in _MULTIMODAL_SKIP_PREFIXES
             ):
+                _skipped_mm += 1
                 continue
 
             if name in ("model.embed_tokens.weight", "lm_head.weight"):
@@ -204,7 +208,39 @@ class LongcatNextTextForCausalLM(LongcatFlashForCausalLM):
 
             filtered.append((name, weight))
 
+        # ── Before delegating: snapshot model params for post-load diff ──
+        _before = {n: p.sum().item() for n, p in self.named_parameters()}
+
         super().load_weights(iter(filtered))
+
+        # ── After delegating: detect params that stayed at their init value ──
+        _unchanged = []
+        _loaded_keys = set()
+        for n, p in self.named_parameters():
+            before_sum = _before.get(n)
+            after_sum = p.sum().item()
+            if before_sum is not None and abs(after_sum - before_sum) < 1e-12:
+                _unchanged.append(n)
+            elif after_sum != 0:
+                _loaded_keys.add(n)
+
+        logger.info(
+            "LongCat-Next load_weights: ckpt_keys=%d mm_skipped=%d "
+            "filtered=%d unchanged=%d loaded=%d",
+            _total_ckpt, _skipped_mm, len(filtered),
+            len(_unchanged), len(_loaded_keys),
+        )
+        if _unchanged:
+            logger.warning(
+                "LongCat-Next: %d params UNCHANGED after weight load "
+                "(possibly not loaded): %s",
+                len(_unchanged),
+                ", ".join(_unchanged[:10]),
+            )
+            if len(_unchanged) > 10:
+                logger.warning(
+                    "  ... and %d more unchanged params", len(_unchanged) - 10
+                )
 
 
 EntryClass = LongcatNextTextForCausalLM
