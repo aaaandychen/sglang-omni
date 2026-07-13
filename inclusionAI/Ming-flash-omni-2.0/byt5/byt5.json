@@ -1,0 +1,18 @@
+{
+  "byt5_mapper_type": "T5EncoderBlockByT5Mapper",
+  "byt5_mapper_config": {
+    "num_layers": 4,
+    "sdxl_channels": 2560
+  },
+  "byt5_config": {
+      "byt5_ckpt_path": "./google__byt5-smal/",
+      "byt5_name": "google/byt5-small", 
+      "special_token": true, 
+      "color_special_token": true,
+      "font_special_token": true,
+      "font_ann_path": "./font_uni_10-lang_idx.json",
+	  "color_ann_path": "./color_idx.json",
+      "multilingual": true
+  },
+  "byt5_max_length": 256
+}

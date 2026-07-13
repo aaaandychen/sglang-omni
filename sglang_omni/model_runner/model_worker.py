@@ -102,6 +102,21 @@ class ModelWorker:
             model_config.head_dim = int(cfg.d_model) // int(cfg.decoder_attention_heads)
             model_config.v_head_dim = model_config.head_dim
             return
+        # LongCat-Next uses MLA; sglang 0.5.10 only auto-detects MLA for
+        # "LongcatFlashForCausalLM" architectures.  Fix up the MLA-related
+        # fields on model_config so the KV pool picks MLATokenToKVPool.
+        if "LongcatNext" in arch:
+            import math
+            from sglang.srt.configs.model_config import AttentionArch
+            cfg = model_config.hf_config
+            model_config.attention_arch = AttentionArch.MLA
+            model_config.kv_lora_rank = cfg.kv_lora_rank
+            model_config.qk_nope_head_dim = cfg.qk_nope_head_dim
+            model_config.qk_rope_head_dim = cfg.qk_rope_head_dim
+            model_config.v_head_dim = cfg.v_head_dim
+            model_config.head_dim = model_config.qk_nope_head_dim + model_config.qk_rope_head_dim
+            model_config.scaling = 1 / math.sqrt(model_config.head_dim)
+
         entry = _ARCH_CONFIG_MAP.get(arch)
         if entry is None:
             return

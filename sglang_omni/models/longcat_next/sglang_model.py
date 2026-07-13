@@ -9,17 +9,16 @@ FFN blocks, RMSNorm — differing only in scale (14 layers vs 28, 3072-dim vs
 This class inherits SGLang's ``LongcatFlashForCausalLM`` and overrides two
 things:
 
-1. **lm_head vocab size** — the parent creates both ``embed_tokens`` and
-   ``lm_head`` from ``config.vocab_size``.  We set ``config.vocab_size =
-   text_vocab_size`` before ``super().__init__`` so the embedding table
-   uses the text-only vocabulary (131 072), then replace ``self.lm_head``
-   with a head sized to ``text_vocab_plus_multimodal_special_token_size``
-   (131 125) so the full checkpoint can be loaded without truncation.
+1. **Config field-name mapping** — LongCat-Next HF config uses
+   ``ffn_hidden_size`` / ``expert_ffn_hidden_size`` / ``num_layers``,
+   but the SGLang model expects ``intermediate_size`` /
+   ``moe_intermediate_size`` / ``num_hidden_layers``.  We map them
+   before ``super().__init__()``.
 
 2. **load_weights** — filters out multimodal component weights (visual /
    audio tokenizer and head layers) before delegating to the parent, and
-   applies a defensive ``[:131125]`` truncation to ``embed_tokens`` and
-   ``lm_head`` weights (same pattern as the official LongCat-Next
+   applies a defensive ``[:full_vocab]`` truncation to ``embed_tokens``
+   and ``lm_head`` weights (same pattern as the official LongCat-Next
    inference backend).
 
 Reference
@@ -39,7 +38,6 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.models.longcat_flash import LongcatFlashForCausalLM
 
 if TYPE_CHECKING:
@@ -62,11 +60,11 @@ _MULTIMODAL_SKIP_PREFIXES: tuple[str, ...] = (
 class LongcatNextTextForCausalLM(LongcatFlashForCausalLM):
     """LongCat-Next AR backbone for sglang-omni (text-only, Phase 1)."""
 
-    # Parent declares ``_tied_weights_keys = ["lm_head.weight"]``.
-    # embed_tokens has 131 072 rows, lm_head has 131 125 rows — they
-    # cannot be tied.  Override to an empty list so ``post_init()`` /
-    # ``tie_weights()`` is a no-op.
-    _tied_weights_keys: list[str] = []
+    # With config.vocab_size = full_vocab (131 125), both embed_tokens
+    # and lm_head have the same shape.  The parent's default weight tying
+    # (_tied_weights_keys = ["lm_head.weight"]) correctly ties them, so
+    # we no longer need to override.
+    _tied_weights_keys: list[str] = ["lm_head.weight"]
 
     # ── __init__ ────────────────────────────────────────────────────────
 
@@ -87,7 +85,6 @@ class LongcatNextTextForCausalLM(LongcatFlashForCausalLM):
                 text_vocab,
             )
         )
-        hidden_size: int = int(config.hidden_size)
 
         # ── Ngram config compatibility ───────────────────────────────
         # SGLang's LongcatFlashModel.__init__ reads:
@@ -136,9 +133,34 @@ class LongcatNextTextForCausalLM(LongcatFlashForCausalLM):
             # If both approaches failed, let super().__init__() raise —
             # the error message will point to the missing field.
 
-        # ── Create parent with text-only vocab ───────────────────────
+        # ── Config field-name compatibility ──────────────────────────
+        # LongCat-Next HF config uses different field names than the
+        # sglang 0.5.10 longcat_flash.py expects.  Map them before
+        # super().__init__() so the upstream code sees the names it needs.
+        # All values are read from the checkpoint's own config.json.
+        if not hasattr(config, "use_ngram_embedding"):
+            config.use_ngram_embedding = False
+        if not hasattr(config, "intermediate_size"):
+            config.intermediate_size = config.ffn_hidden_size
+        if not hasattr(config, "moe_intermediate_size"):
+            config.moe_intermediate_size = config.expert_ffn_hidden_size
+        if not hasattr(config, "num_hidden_layers"):
+            config.num_hidden_layers = config.num_layers
+        if not hasattr(config, "hidden_act"):
+            config.hidden_act = "silu"
+        if not hasattr(config, "rope_parameters"):
+            config.rope_parameters = {"rope_theta": config.rope_theta}
+        if not hasattr(config, "router_bias"):
+            config.router_bias = False
+        if not hasattr(config, "rounter_params_dtype"):
+            config.rounter_params_dtype = "bfloat16"
+
+        # ── Create parent with full vocab (embed_tokens + lm_head) ──
+        # Use full_vocab (131125) so that embed_tokens.org_vocab_size
+        # matches the checkpoint weight shape.  The extra multimodal
+        # embedding rows are never activated by text-only inputs.
         saved_vocab = int(config.vocab_size)
-        config.vocab_size = text_vocab
+        config.vocab_size = full_vocab
         try:
             super().__init__(
                 config, quant_config=quant_config, prefix=prefix
@@ -146,31 +168,24 @@ class LongcatNextTextForCausalLM(LongcatFlashForCausalLM):
         finally:
             config.vocab_size = saved_vocab
 
-        # ── Replace lm_head with full-vocab version ──────────────────
-        if full_vocab != text_vocab:
-            from sglang.srt.server_args import get_global_server_args
-
-            use_attn_tp = bool(
-                getattr(get_global_server_args(), "enable_dp_lm_head", False)
-            )
-            head_prefix = f"{prefix}lm_head" if prefix else "lm_head"
-            self.lm_head = ParallelLMHead(
-                full_vocab,
-                hidden_size,
-                quant_config=quant_config,
-                prefix=head_prefix,
-                use_attn_tp_group=use_attn_tp,
-            )
+        # lm_head is already created by the parent with
+        # config.vocab_size = full_vocab (131125) — no replacement needed.
 
     # ── load_weights ────────────────────────────────────────────────────
 
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]]
     ) -> None:
-        """Filter multimodal weights, then delegate to the parent.
+        """Filter multimodal weights, fix Q/KV fusion, delegate to parent.
 
         Mirror of the official ``NmmFlashForCausalLM.load_weights``
-        (modules/nmm_flash.py in the LongCat-Next inference repo).
+        (modules/nmm_flash.py in the LongCat-Next inference repo), with one
+        added workaround: the LongCat-Next checkpoint does **not** contain
+        ``kv_a_proj_with_mqa`` weights.  SGLang's upstream ``load_weights``
+        fuses ``q_a_proj`` + ``kv_a_proj_with_mqa`` → ``fused_qkv_a_proj_with_mqa``,
+        but without ``kv_a_proj_with_mqa`` the ``q_a_proj`` weight is
+        silently dropped.  We manually load ``q_a_proj`` into the first
+        portion of the fused parameter before delegating to the parent.
         """
         full_vocab: int = int(
             getattr(
@@ -179,6 +194,16 @@ class LongcatNextTextForCausalLM(LongcatFlashForCausalLM):
                 self.config.vocab_size,
             )
         )
+
+        # ── Collect q_a_proj weights for manual loading ──────────────
+        # SGLang creates ``fused_qkv_a_proj_with_mqa`` with shape
+        #   [q_lora_rank + kv_lora_rank + qk_rope_head_dim, hidden_size]
+        #   = [1536 + 512 + 64, 3072] = [2112, 3072]
+        # The checkpoint has only ``q_a_proj`` of shape [1536, 3072].
+        # We load it into the first 1536 rows; the remaining 576 rows
+        # stay as the parent's random init (harmless — they correspond
+        # to ``kv_a_proj_with_mqa`` which is absent from the checkpoint).
+        _q_a_buffers: dict[str, torch.Tensor] = {}
 
         filtered: list[Tuple[str, torch.Tensor]] = []
         for name, weight in weights:
@@ -189,22 +214,50 @@ class LongcatNextTextForCausalLM(LongcatFlashForCausalLM):
             ):
                 continue
 
-            # Defensive truncation: the official code applies
-            # ``weight[:131125]`` to both embed_tokens and lm_head.
-            # For embed_tokens (131 072 rows) this is a no-op; for
-            # lm_head it guards against unexpected padding rows.
-            if name == "model.embed_tokens.weight":
+            # Truncate: both embed_tokens and lm_head share the full vocab
+            # (131125).  The extra multimodal embedding rows are never
+            # referenced by text-only input tokens but are harmless to keep.
+            if name in ("model.embed_tokens.weight", "lm_head.weight"):
                 weight = weight[:full_vocab]
-            elif name == "lm_head.weight":
-                weight = weight[:full_vocab]
+
+            # Intercept q_a_proj weights — the parent's fusion logic will
+            # drop them because kv_a_proj_with_mqa is absent.
+            if "self_attn" in name and "q_a_proj" in name:
+                _q_a_buffers[name] = weight
+                continue
 
             filtered.append((name, weight))
 
-        # Parent handles: MLA (fused QKV), MoE (stacked params +
-        # expert mapping), ngram embeddings (routes
-        # ``model.ngram_embeddings.*`` → ``NgramEmbedding.load_weight``),
-        # and all standard backbone layers.
+        # ── Delegate to parent ───────────────────────────────────────
         super().load_weights(iter(filtered))
+
+        # ── Manually load q_a_proj into fused_qkv_a_proj_with_mqa ───
+        if _q_a_buffers:
+            params_dict = dict(self.named_parameters())
+            from sglang.srt.model_loader.weight_utils import default_weight_loader
+
+            for name, q_a_weight in _q_a_buffers.items():
+                # model.layers.N.self_attn.M.q_a_proj.weight
+                # → model.layers.N.self_attn.M.fused_qkv_a_proj_with_mqa.weight
+                fused_name = name.replace(
+                    "q_a_proj.weight", "fused_qkv_a_proj_with_mqa.weight"
+                )
+                param = params_dict.get(fused_name)
+                if param is None:
+                    logger.warning(
+                        "q_a_proj weight %s has no matching fused param %s",
+                        name, fused_name,
+                    )
+                    continue
+                # Load q_a_proj into the first rows of fused param
+                q_rows = q_a_weight.shape[0]
+                param.data[:q_rows].copy_(q_a_weight.to(
+                    device=param.device, dtype=param.dtype
+                ))
+                logger.debug(
+                    "Manually loaded %s (%s) → %s[:%d]",
+                    name, tuple(q_a_weight.shape), fused_name, q_rows,
+                )
 
 
 EntryClass = LongcatNextTextForCausalLM

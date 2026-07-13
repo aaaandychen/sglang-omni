@@ -31,9 +31,11 @@ class LongcatNextTextPipelineConfig(PipelineConfig):
             factory_args={
                 "device": "cuda:0",
                 "max_running_requests": 32,
+                "enable_torch_compile": False,
+                "mem_fraction_static": 0.85,
             },
-            gpu=0,
-            tp_size=1,
+            gpu=[0, 1, 2, 3],
+            tp_size=4,
             terminal=True,
         )
     ]

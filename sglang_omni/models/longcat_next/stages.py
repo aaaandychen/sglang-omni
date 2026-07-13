@@ -19,6 +19,7 @@ def create_longcat_next_text_executor(
     tp_size: int = 1,
     tp_rank: int = 0,
     server_args_overrides: dict[str, Any] | None = None,
+    nccl_port: int | None = None,
 ):
     """Create an OmniScheduler for the LongCat-Next text backbone.
 
@@ -81,7 +82,7 @@ def create_longcat_next_text_executor(
     overrides = build_generation_batch_overrides(
         max_running_requests=max_running_requests,
         server_args_overrides=server_args_overrides,
-        disable_cuda_graph=False,
+        disable_cuda_graph=True,
         disable_overlap_schedule=True,
         enable_torch_compile=enable_torch_compile,
         mem_fraction_static=mem_fraction_static,
@@ -115,6 +116,7 @@ def create_longcat_next_text_executor(
         server_args,
         gpu_id,
         tp_rank=tp_rank,
+        nccl_port=nccl_port,
         model_arch_override="LongcatNextTextForCausalLM",
     )
 

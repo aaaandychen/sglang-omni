@@ -100,13 +100,19 @@ def make_longcat_next_text_adapters(
         # Tokenize
         messages = [{"role": "user", "content": text}]
         try:
-            input_ids: list[int] = tokenizer.apply_chat_template(
+            tokenized = tokenizer.apply_chat_template(
                 messages,
                 tokenize=True,
                 add_generation_prompt=True,
             )
+            # BatchEncoding is not a dict subclass in transformers 5.x
+            if hasattr(tokenized, "input_ids"):
+                input_ids = tokenized.input_ids
+            else:
+                input_ids = tokenized
         except (AttributeError, ValueError):
             input_ids = tokenizer.encode(text)
+        input_ids = list(map(int, input_ids))
 
         # Sampling params
         temperature: float = float(params.get("temperature", 0.7))
