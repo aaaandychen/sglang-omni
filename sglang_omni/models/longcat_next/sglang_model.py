@@ -176,16 +176,12 @@ class LongcatNextTextForCausalLM(LongcatFlashForCausalLM):
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]]
     ) -> None:
-        """Filter multimodal weights, fix Q/KV fusion, delegate to parent.
+        """Filter multimodal weights, then delegate to the parent.
 
         Mirror of the official ``NmmFlashForCausalLM.load_weights``
-        (modules/nmm_flash.py in the LongCat-Next inference repo), with one
-        added workaround: the LongCat-Next checkpoint does **not** contain
-        ``kv_a_proj_with_mqa`` weights.  SGLang's upstream ``load_weights``
-        fuses ``q_a_proj`` + ``kv_a_proj_with_mqa`` → ``fused_qkv_a_proj_with_mqa``,
-        but without ``kv_a_proj_with_mqa`` the ``q_a_proj`` weight is
-        silently dropped.  We manually load ``q_a_proj`` into the first
-        portion of the fused parameter before delegating to the parent.
+        (modules/nmm_flash.py in the LongCat-Next inference repo).
+        The checkpoint contains both ``q_a_proj`` and ``kv_a_proj_with_mqa``
+        weights → SGLang's native Q/KV fusion works correctly.
         """
         full_vocab: int = int(
             getattr(
@@ -195,69 +191,20 @@ class LongcatNextTextForCausalLM(LongcatFlashForCausalLM):
             )
         )
 
-        # ── Collect q_a_proj weights for manual loading ──────────────
-        # SGLang creates ``fused_qkv_a_proj_with_mqa`` with shape
-        #   [q_lora_rank + kv_lora_rank + qk_rope_head_dim, hidden_size]
-        #   = [1536 + 512 + 64, 3072] = [2112, 3072]
-        # The checkpoint has only ``q_a_proj`` of shape [1536, 3072].
-        # We load it into the first 1536 rows; the remaining 576 rows
-        # stay as the parent's random init (harmless — they correspond
-        # to ``kv_a_proj_with_mqa`` which is absent from the checkpoint).
-        _q_a_buffers: dict[str, torch.Tensor] = {}
-
         filtered: list[Tuple[str, torch.Tensor]] = []
         for name, weight in weights:
-            # Drop multimodal component weights.
             if any(
                 name.startswith(prefix)
                 for prefix in _MULTIMODAL_SKIP_PREFIXES
             ):
                 continue
 
-            # Truncate: both embed_tokens and lm_head share the full vocab
-            # (131125).  The extra multimodal embedding rows are never
-            # referenced by text-only input tokens but are harmless to keep.
             if name in ("model.embed_tokens.weight", "lm_head.weight"):
                 weight = weight[:full_vocab]
 
-            # Intercept q_a_proj weights — the parent's fusion logic will
-            # drop them because kv_a_proj_with_mqa is absent.
-            if "self_attn" in name and "q_a_proj" in name:
-                _q_a_buffers[name] = weight
-                continue
-
             filtered.append((name, weight))
 
-        # ── Delegate to parent ───────────────────────────────────────
         super().load_weights(iter(filtered))
-
-        # ── Manually load q_a_proj into fused_qkv_a_proj_with_mqa ───
-        if _q_a_buffers:
-            params_dict = dict(self.named_parameters())
-            from sglang.srt.model_loader.weight_utils import default_weight_loader
-
-            for name, q_a_weight in _q_a_buffers.items():
-                # model.layers.N.self_attn.M.q_a_proj.weight
-                # → model.layers.N.self_attn.M.fused_qkv_a_proj_with_mqa.weight
-                fused_name = name.replace(
-                    "q_a_proj.weight", "fused_qkv_a_proj_with_mqa.weight"
-                )
-                param = params_dict.get(fused_name)
-                if param is None:
-                    logger.warning(
-                        "q_a_proj weight %s has no matching fused param %s",
-                        name, fused_name,
-                    )
-                    continue
-                # Load q_a_proj into the first rows of fused param
-                q_rows = q_a_weight.shape[0]
-                param.data[:q_rows].copy_(q_a_weight.to(
-                    device=param.device, dtype=param.dtype
-                ))
-                logger.debug(
-                    "Manually loaded %s (%s) → %s[:%d]",
-                    name, tuple(q_a_weight.shape), fused_name, q_rows,
-                )
 
 
 EntryClass = LongcatNextTextForCausalLM
