@@ -135,22 +135,19 @@ class LongcatNextTextForCausalLM(LongcatFlashForCausalLM):
 
         # ── Config field-name compatibility ──────────────────────────
         # LongCat-Next HF config uses different field names than the
-        # sglang 0.5.10 longcat_flash.py expects.  Map them before
-        # super().__init__() so the upstream code sees the names it needs.
-        # All values are read from the checkpoint's own config.json.
+        # sglang 0.5.10 longcat_flash.py expects.  ModelConfig may
+        # already have these attributes with wrong defaults, so we
+        # unconditionally override from the HF config source fields.
         if not hasattr(config, "use_ngram_embedding"):
             config.use_ngram_embedding = False
-        if not hasattr(config, "intermediate_size"):
-            config.intermediate_size = config.ffn_hidden_size
-        if not hasattr(config, "moe_intermediate_size"):
-            config.moe_intermediate_size = config.expert_ffn_hidden_size
-        if not hasattr(config, "num_hidden_layers"):
-            config.num_hidden_layers = config.num_layers
-        if not hasattr(config, "hidden_act"):
+        config.intermediate_size = getattr(config, "ffn_hidden_size", None) or 6144
+        config.moe_intermediate_size = getattr(config, "expert_ffn_hidden_size", None) or 1024
+        config.num_hidden_layers = getattr(config, "num_layers", None) or 14
+        if not hasattr(config, "hidden_act") or not getattr(config, "hidden_act", None):
             config.hidden_act = "silu"
         if not hasattr(config, "rope_parameters"):
             config.rope_parameters = {"rope_theta": config.rope_theta}
-        if not hasattr(config, "router_bias"):
+        if not hasattr(config, "router_bias") or getattr(config, "router_bias", None) is None:
             config.router_bias = False
         if not hasattr(config, "rounter_params_dtype"):
             config.rounter_params_dtype = "bfloat16"
