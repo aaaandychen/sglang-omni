@@ -94,6 +94,7 @@ class SGLModelRunner(ModelRunner):
             "LLaDA2MoeModelLM": "sglang_omni.models.llada2_uni.components.thinker:LLaDA2MoeModelLM",
             "WhisperForConditionalGeneration": "sglang_omni.models.whisper_asr.sglang_model:WhisperForConditionalGeneration",
             "Qwen3ASRForConditionalGeneration": "sglang_omni.models.qwen3_asr.sglang_model:Qwen3ASRForConditionalGeneration",
+            "LongcatNextTextForCausalLM": "sglang_omni.models.longcat_next.sglang_model:LongcatNextTextForCausalLM",
         }
         for arch, path in sglang_omni_models.items():
             module_path, _, attr = path.partition(":")
