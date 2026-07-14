@@ -98,6 +98,11 @@ def create_longcat_next_text_executor(
         tp_size=tp_size,
         **overrides,
     )
+    # SGLang 0.5.12 Triton MoE kernel (3.5.1) crashes on H800 SM90.
+    # Force flashinfer_cutlass MoE backend to bypass Triton entirely.
+    # flashinfer_cutlass is in SGLang's MOE_RUNNER_BACKEND_CHOICES.
+    server_args.moe_runner_backend = "flashinfer_cutlass"
+
     validate_generation_batch_policy(
         model_name="LongCat-Next Text",
         server_args=server_args,
