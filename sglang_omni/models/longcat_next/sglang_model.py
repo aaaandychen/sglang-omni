@@ -38,12 +38,77 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.models.longcat_flash import LongcatFlashForCausalLM
+from sglang.srt.models.longcat_flash import LongcatFlashForCausalLM, LongcatFlashMoE
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
+
+
+# ── zero-expert / non-EP illegal-memory-access fix ───────────────────────
+# LongCat-Next's MoE has 256 routed experts + 128 ``identity`` zero-experts;
+# the router emits 384-wide logits and top-k picks 12.  SGLang's
+# ``LongcatFlashMoE.forward`` calls ``zero_experts_compute_triton`` which
+# rewrites every zero-expert slot in ``topk_idx`` to ``-1`` in place (and
+# zeroes its combine weight), then hands ``topk_idx`` to a plain FusedMoE.
+#
+# The Triton ``fused_moe_kernel`` only skips ``off_experts == -1`` blocks
+# when ``filter_expert`` is true, and ``filter_expert`` is
+# ``num_experts != num_local_experts`` — which is *false* under pure TP
+# (every rank owns all 256 experts).  So the ``-1`` slots are not skipped
+# and the kernel indexes ``w13_weight[-1]`` → CUDA illegal memory access.
+#
+# Fix: clamp the ``-1`` slots to expert 0 before they reach ``self.experts``.
+# Their combine weight is already 0 (set by ``zero_experts_compute_triton``),
+# so the down-projection multiplies their contribution by 0 — numerically
+# identical to skipping them, but without the out-of-bounds index.
+def _longcat_moe_forward_zero_expert_safe(
+    self: LongcatFlashMoE, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    from sglang.srt.models.longcat_flash import (
+        StandardTopKOutput,
+        tensor_model_parallel_all_reduce,
+        zero_experts_compute_triton,
+    )
+
+    num_tokens, hidden_dim = hidden_states.shape
+    hidden_states = hidden_states.view(-1, hidden_dim)
+
+    router_logits = self.router(hidden_states)
+    topk_weights, topk_idx, _ = self.topk(hidden_states, router_logits)
+
+    zero_expert_result = None
+    if self.zero_expert_type is not None:
+        # Rewrites zero-expert slots in topk_idx to -1 and zeroes their weight.
+        zero_expert_result = zero_experts_compute_triton(
+            expert_indices=topk_idx,
+            expert_scales=topk_weights,
+            num_experts=self.num_experts,
+            zero_expert_type=self.zero_expert_type,
+            hidden_states=hidden_states,
+        )
+        # Clamp -1 (zero-expert / filtered) slots to a valid expert index so
+        # the FusedMoE kernel never dereferences w[-1].  These slots carry a
+        # zero combine weight, so their contribution stays exactly 0.
+        topk_idx = topk_idx.masked_fill(topk_idx < 0, 0)
+
+    topk_output = StandardTopKOutput(topk_weights, topk_idx, _)
+
+    final_hidden_states = self.experts(hidden_states, topk_output)
+    final_hidden_states *= self.routed_scaling_factor
+
+    if zero_expert_result is not None and hidden_states.shape[0] > 0:
+        final_hidden_states += zero_expert_result.to(final_hidden_states.device)
+
+    if self.tp_size > 1:
+        final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+    return final_hidden_states.view(num_tokens, hidden_dim)
+
+
+# Install the patched forward once, at import time.
+LongcatFlashMoE.forward = _longcat_moe_forward_zero_expert_safe
 
 # Multimodal components present in the full LongCat-Next checkpoint but
 # unused by the text-only AR backbone.  Their weights are filtered out in
@@ -86,52 +151,40 @@ class LongcatNextTextForCausalLM(LongcatFlashForCausalLM):
             )
         )
 
-        # ── Ngram config compatibility ───────────────────────────────
-        # SGLang's LongcatFlashModel.__init__ reads:
-        #   config.use_ngram_embedding        (→ whether to use NgramEmbedding)
-        #   config.ngram_embedding_{m,k,n}    (→ NgramEmbedding constructor params)
+        # ── Ngram embedding config derivation ────────────────────────
+        # LongCat-Next's input embedding is NgramEmbedding (word embedding
+        # plus 12 n-gram projection terms, meaned over 13 tensors).  The
+        # stock LongcatFlashModel.__init__ builds it when config.use_ngram_
+        # embedding is True and reads config.ngram_embedding_{m,k,n}.
         #
-        # SGLang's own LongcatFlashConfig computes these from
-        # ngram_vocab_size_ratio / emb_neighbor_num / emb_split_num,
-        # which are also the field names used by LongCat-Next's HF config.
-        # When the HF config is loaded via trust_remote_code=True,
-        # LongcatFlashNgramConfig exposes them as derived properties, so
-        # ngram should work out of the box.
+        # SGLang's own LongcatFlashConfig derives these from
+        # ngram_vocab_size_ratio / emb_neighbor_num / emb_split_num.  But
+        # LongCat-Next ships a LongcatNextConfig (trust_remote_code) that
+        # carries only the RAW fields, not the derived ones — so we derive
+        # them here, mirroring configs/longcat_flash.py.
         #
-        # If it doesn't (e.g. stripped config or name mismatch), disable
-        # ngram before super().__init__() — once the model is created the
-        # embedding type is baked in and cannot be changed.
-        _want_ngram = bool(getattr(config, "use_ngram_embedding", False))
-        _has_ngram_params = all(
-            hasattr(config, attr)
-            for attr in (
-                "ngram_embedding_m",
-                "ngram_embedding_k",
-                "ngram_embedding_n",
+        # CRITICAL: ngram_embedding_m (the n-gram hash modulus base) must be
+        # derived from the TEXT vocab (131072), NOT the full vocab (131125)
+        # which includes 53 multimodal special tokens.  Verified against the
+        # checkpoint: embedders.0.weight has 10223617 = int(78*131072)+1 rows.
+        # Using full_vocab would break the load-weight shape assertion.
+        _ngram_ratio = getattr(config, "ngram_vocab_size_ratio", None)
+        if _ngram_ratio is not None and _ngram_ratio > 0:
+            config.use_ngram_embedding = True
+            config.ngram_embedding_m = int(_ngram_ratio * text_vocab)
+            config.ngram_embedding_n = int(getattr(config, "emb_neighbor_num", 4))
+            config.ngram_embedding_k = int(getattr(config, "emb_split_num", 4))
+            logger.info(
+                "LongCat-Next: ngram embedding enabled "
+                "(m=%d, n=%d, k=%d, word_table=%d, hash_base=%d)",
+                config.ngram_embedding_m,
+                config.ngram_embedding_n,
+                config.ngram_embedding_k,
+                full_vocab,
+                text_vocab,
             )
-        )
-        if _want_ngram and not _has_ngram_params:
-            logger.warning(
-                "LongCat-Next: ngram embedding requested but config is "
-                "missing ngram_embedding_{m,k,n}.  Falling back to "
-                "standard VocabParallelEmbedding."
-            )
-            # Approach 1: set use_ngram_embedding=False on ModelConfig
-            # (it's a plain instance attribute, not a property).
-            try:
-                config.use_ngram_embedding = False
-            except AttributeError:
-                pass
-            # Approach 2: if use_ngram_embedding is derived from
-            # ngram_vocab_size_ratio (as in LongcatFlashConfig),
-            # zeroing the ratio also disables it.
-            if getattr(config, "use_ngram_embedding", False):
-                try:
-                    config.ngram_vocab_size_ratio = 0
-                except AttributeError:
-                    pass
-            # If both approaches failed, let super().__init__() raise —
-            # the error message will point to the missing field.
+        else:
+            config.use_ngram_embedding = False
 
         # ── Config field-name compatibility ──────────────────────────
         # LongCat-Next HF config uses different field names than the
@@ -167,6 +220,39 @@ class LongcatNextTextForCausalLM(LongcatFlashForCausalLM):
 
         # lm_head is already created by the parent with
         # config.vocab_size = full_vocab (131125) — no replacement needed.
+
+        # ── Fix ngram hash base (text_vocab, not word-table size) ─────
+        # The parent built NgramEmbedding with num_embeddings=full_vocab
+        # (131125) so word_embeder has the right row count.  But the venv
+        # NgramEmbedding uses that SAME num_embeddings as the n-gram hash
+        # base in pow(num_embeddings, delta, mod) (n_gram_embedding.py),
+        # whereas the model was trained with the TEXT vocab (131072) as the
+        # base — the two differ by the 53 multimodal special tokens.  A
+        # wrong base yields entirely different oe_weights → wrong n-gram ids
+        # → garbage output.  Recompute oe_weights (a plain, non-persistent
+        # CUDA buffer) with base=text_vocab.  Mirrors the official fork's
+        # FusedOverEmbedding num_embeddings_text parameter (over_embedding.py).
+        if getattr(config, "use_ngram_embedding", False):
+            from sglang.srt.layers.n_gram_embedding import NgramEmbedding
+
+            for ng in self.modules():
+                if not isinstance(ng, NgramEmbedding):
+                    continue
+                N = ng.over_embedding_n
+                K = ng.over_embedding_k
+                M = ng.over_embedding_m
+                for n in range(2, N + 1):
+                    for k in range(K):
+                        mod = M + 2 * ((n - 2) * K + k) + 1
+                        ng.oe_mods[n - 2][k] = mod
+                        for delta in range(N):
+                            ng.oe_weights[n - 2][k][delta] = pow(
+                                text_vocab, delta, mod
+                            )
+                logger.info(
+                    "LongCat-Next: recomputed oe_weights with hash_base=%d",
+                    text_vocab,
+                )
 
     # ── load_weights ────────────────────────────────────────────────────
 

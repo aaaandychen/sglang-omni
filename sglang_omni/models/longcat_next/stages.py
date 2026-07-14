@@ -15,7 +15,7 @@ def create_longcat_next_text_executor(
     max_new_tokens: int = 4096,
     context_length: int = 131072,
     mem_fraction_static: float | None = None,
-    enable_torch_compile: bool = True,
+    enable_torch_compile: bool = False,
     tp_size: int = 1,
     tp_rank: int = 0,
     server_args_overrides: dict[str, Any] | None = None,

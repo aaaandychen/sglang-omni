@@ -390,7 +390,20 @@ class OmniScheduler:
         )
         # High-water mark, not a cap. Mirrors upstream Scheduler.__init__ (sglang/srt/managers/scheduler.py).
         self.max_prefill_bs = 0
-        self.use_ngram_embedding = False
+        # Ngram embedding runtime state (LongCat-Next).  Stock Scheduler does
+        # this in maybe_init_ngram_embedding; OmniScheduler doesn't inherit it,
+        # so mirror it here.  model_config.use_ngram_embedding was derived in
+        # ModelWorker._apply_arch_override before the model runner was built,
+        # which also allocated model_runner.token_table + ran init_buffers.
+        # Guarded so non-ngram models are unaffected (flag stays False).
+        self.use_ngram_embedding = bool(
+            getattr(self.model_config, "use_ngram_embedding", False)
+        )
+        if self.use_ngram_embedding:
+            self.token_table = self.tp_worker.model_runner.token_table
+            _hf = self.model_config.hf_config
+            self.ngram_embedding_n = _hf.ngram_embedding_n
+            self.ngram_embedding_k = _hf.ngram_embedding_k
         self.return_health_check_ipcs = []
         self.enable_overlap_mlx = False
         # Upstream scheduler_runtime_checker_mixin._streaming_session_count
@@ -820,6 +833,62 @@ class OmniScheduler:
         except Exception as exc:
             self._handle_batch_failure(batch, exc)
             return _FAILED_BATCH_RESULT
+
+    def _maybe_prepare_ngram_embedding(self, batch):
+        """Fill the ngram token table before an EXTEND forward.
+
+        Ported from stock Scheduler._maybe_prepare_ngram_embedding
+        (sglang/srt/managers/scheduler.py).  OmniScheduler reaches stock
+        ``get_next_batch_to_run`` via ``__getattr__``, which calls this method
+        by name (``ret = self._maybe_prepare_ngram_embedding(ret)``) — so
+        defining it here overrides the stock version on the normal MRO.  We
+        MUST return ``batch`` to match the stock contract, otherwise the batch
+        is dropped (ret becomes None) and the event loop idles forever.
+
+        Sets batch.ne_token_table, which flows through get_model_worker_batch()
+        -> ForwardBatch.init_new -> ngram_embedding_info.  Decode-step updates
+        are handled by ModelRunner.sample's maybe_update_ngram_token_table.
+        No-op unless ngram is enabled.
+        """
+        if batch is None or not self.use_ngram_embedding:
+            return batch
+        batch.ne_token_table = self.token_table
+        if not batch.forward_mode.is_extend():
+            return batch
+
+        from sglang.jit_kernel.ngram_embedding import update_token_table
+
+        all_tokens = []
+        column_starts = []
+        request_lengths = []
+        for req in batch.reqs:
+            start = len(req.prefix_indices)
+            end = start + req.extend_input_len
+            fill_ids = req.origin_input_ids + req.output_ids
+            if start == 0:
+                tokens = fill_ids[start:end]
+                column_starts.append(0)
+            elif start < self.ngram_embedding_n:
+                tokens = fill_ids[0:end]
+                column_starts.append(0)
+            else:
+                # Prepend n-1 tokens before prefix_len for n-gram context.
+                tokens = fill_ids[start - self.ngram_embedding_n + 1 : end]
+                column_starts.append(start - self.ngram_embedding_n + 1)
+            all_tokens.extend(tokens)
+            request_lengths.append(len(tokens))
+
+        dtype = self.token_table.dtype
+        device = self.token_table.device
+        update_token_table(
+            ne_token_table=self.token_table,
+            tokens=torch.tensor(all_tokens, dtype=dtype, device=device),
+            row_indices=batch.req_pool_indices,
+            column_starts=torch.tensor(column_starts, dtype=torch.int32, device=device),
+            req_lens=torch.tensor(request_lengths, dtype=torch.int32, device=device),
+            ignore_tokens=None,
+        )
+        return batch
 
     def _run_batch(self, batch, pp_proxy_tensors=None):
         """Run a batch through the model runner.

@@ -117,6 +117,23 @@ class ModelWorker:
             model_config.head_dim = model_config.qk_nope_head_dim + model_config.qk_rope_head_dim
             model_config.scaling = 1 / math.sqrt(model_config.head_dim)
 
+            # LongCat-Next's input embedding is NgramEmbedding.  The stock
+            # ModelRunner.maybe_init_ngram_embedding and ForwardBatch.init_new
+            # both gate on model_config.use_ngram_embedding, which was frozen
+            # to False at ModelConfig construction (the raw LongcatNextConfig
+            # lacks the derived field).  Derive it here — BEFORE the model
+            # runner is built — so the token table is allocated and
+            # init_buffers runs.  The model wrapper (sglang_model.py) derives
+            # the same m/k/n onto hf_config for the NgramEmbedding constructor.
+            _ngram_ratio = getattr(cfg, "ngram_vocab_size_ratio", None)
+            if _ngram_ratio is not None and _ngram_ratio > 0:
+                _text_vocab = int(getattr(cfg, "text_vocab_size", cfg.vocab_size))
+                cfg.use_ngram_embedding = True
+                cfg.ngram_embedding_m = int(_ngram_ratio * _text_vocab)
+                cfg.ngram_embedding_n = int(getattr(cfg, "emb_neighbor_num", 4))
+                cfg.ngram_embedding_k = int(getattr(cfg, "emb_split_num", 4))
+                model_config.use_ngram_embedding = True
+
         entry = _ARCH_CONFIG_MAP.get(arch)
         if entry is None:
             return
