@@ -233,3 +233,4 @@ illegal memory access。(EP 分片场景才 `filter_expert=True`,故上游未暴
 - 未来多模态:ngram 兼容的 embedding 注入路径是 `replace_embeds`/`replace_positions`
   (先对文本算 ngram embedding,再 scatter 覆盖多模态位置),不能用整段替换的 `input_embeds`
 
+2026-07-14 10:01:46,564 [WARNING] sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config: Using MoE kernel config with down_moe=False. Performance might be sub-optimal! Config file not found at /mnt/cephfs/chenzhenyang/czy/sglang-omni/.venv/lib/python3.12/site-packages/sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_3_6_0/E=256,N=256,device_name=NVIDIA_H800_down.json, you can create them with https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton
