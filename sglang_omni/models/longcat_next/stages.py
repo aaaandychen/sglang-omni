@@ -1,9 +1,101 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stage factory for LongCat-Next text-only AR backbone."""
+"""Stage factories for LongCat-Next pipelines."""
 
 from __future__ import annotations
 
 from typing import Any
+
+
+def create_preprocessing_executor(model_path: str):
+    from sglang_omni.models.longcat_next.components.preprocessor import (
+        LongcatNextPreprocessor,
+    )
+    from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+
+    preprocessor = LongcatNextPreprocessor(model_path)
+
+    def _preprocess(payload):
+        return preprocessor(payload)
+
+    return SimpleScheduler(_preprocess)
+
+
+def create_aggregate_executor():
+    from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+
+    def _identity(payload):
+        return payload
+
+    return SimpleScheduler(_identity)
+
+
+def create_image_encoder_executor(
+    model_path: str,
+    *,
+    device: str = "cuda",
+    dtype: str | None = "bfloat16",
+):
+    from sglang_omni.models.longcat_next.components.encoders import (
+        LongcatNextImageEncoder,
+    )
+    from sglang_omni.models.longcat_next.payload_types import (
+        IMAGE_STAGE,
+        LongcatNextPipelineState,
+        payload_with_state,
+    )
+    from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+
+    model = LongcatNextImageEncoder(model_path, device=device, dtype=dtype)
+
+    def _encode(payload):
+        state = LongcatNextPipelineState.from_dict(payload.data)
+        inputs = state.encoder_inputs.get(IMAGE_STAGE) or {}
+        if not inputs:
+            state.encoder_outs[IMAGE_STAGE] = {}
+            return payload_with_state(payload, state)
+        result = model(
+            pixel_values=inputs["pixel_values"],
+            visual_grid_thw=inputs["visual_grid_thw"],
+        )
+        state.encoder_outs[IMAGE_STAGE] = result
+        return payload_with_state(payload, state)
+
+    return SimpleScheduler(_encode)
+
+
+def create_audio_encoder_executor(
+    model_path: str,
+    *,
+    device: str = "cuda",
+    dtype: str | None = "bfloat16",
+):
+    from sglang_omni.models.longcat_next.components.encoders import (
+        LongcatNextAudioEncoder,
+    )
+    from sglang_omni.models.longcat_next.payload_types import (
+        AUDIO_STAGE,
+        LongcatNextPipelineState,
+        payload_with_state,
+    )
+    from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+
+    model = LongcatNextAudioEncoder(model_path, device=device, dtype=dtype)
+
+    def _encode(payload):
+        state = LongcatNextPipelineState.from_dict(payload.data)
+        inputs = state.encoder_inputs.get(AUDIO_STAGE) or {}
+        if not inputs:
+            state.encoder_outs[AUDIO_STAGE] = {}
+            return payload_with_state(payload, state)
+        result = model(
+            audio=inputs["audio"],
+            encoder_length=inputs["encoder_length"],
+            bridge_length=inputs["bridge_length"],
+        )
+        state.encoder_outs[AUDIO_STAGE] = result
+        return payload_with_state(payload, state)
+
+    return SimpleScheduler(_encode)
 
 
 def create_longcat_next_text_executor(
@@ -21,39 +113,10 @@ def create_longcat_next_text_executor(
     server_args_overrides: dict[str, Any] | None = None,
     nccl_port: int | None = None,
 ):
-    """Create an OmniScheduler for the LongCat-Next text backbone.
-
-    Parameters
-    ----------
-    model_path:
-        HF model id or local path to the **full** LongCat-Next checkpoint.
-        Visual/audio weights are present on disk but skipped at load time.
-    device:
-        ``"cuda:0"``-style device string.
-    dtype:
-        Computation dtype (``"bfloat16"`` / ``"float16"``).
-    max_running_requests:
-        Maximum concurrent requests admitted to the batch.
-    max_new_tokens:
-        Per-request token budget passed to :class:`SamplingParams`.
-    context_length:
-        SGLang context length.  LongCat-Next supports up to 131 072.
-    mem_fraction_static:
-        Fraction of GPU memory reserved for KV cache (SGLang
-        ``mem_fraction_static``).  ``None`` lets SGLang auto-select.
-    enable_torch_compile:
-        Enable ``torch.compile`` for the decode path.
-    tp_size:
-        Tensor-parallel size (passed through to SGLang ServerArgs).
-        sglang-omni injects this from ``StageConfig.tp_size``.
-    tp_rank:
-        Tensor-parallel rank within this stage (injected by the runtime).
-    server_args_overrides:
-        Extra SGLang ServerArgs forwarded to ``build_sglang_server_args``.
-    """
+    """Create an OmniScheduler for the LongCat-Next AR backbone."""
     from transformers import AutoTokenizer
 
-    from sglang_omni.model_runner.base import ModelRunner
+    from sglang_omni.models.longcat_next.model_runner import LongcatNextModelRunner
     from sglang_omni.models.longcat_next.request_builders import (
         make_longcat_next_text_adapters,
     )
@@ -70,15 +133,9 @@ def create_longcat_next_text_executor(
         build_sglang_server_args,
     )
 
-    # ── GPU id ─────────────────────────────────────────────────────────
     gpu_id = int(device.split(":")[-1]) if ":" in device else tp_rank
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
-    # ── Tokenizer ──────────────────────────────────────────────────────
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path, trust_remote_code=True
-    )
-
-    # ── SGLang ServerArgs ──────────────────────────────────────────────
     overrides = build_generation_batch_overrides(
         max_running_requests=max_running_requests,
         server_args_overrides=server_args_overrides,
@@ -98,9 +155,6 @@ def create_longcat_next_text_executor(
         tp_size=tp_size,
         **overrides,
     )
-    # SGLang 0.5.12 Triton MoE kernel (3.5.1) crashes on H800 SM90.
-    # Force flashinfer_cutlass MoE backend to bypass Triton entirely.
-    # flashinfer_cutlass is in SGLang's MOE_RUNNER_BACKEND_CHOICES.
     server_args.moe_runner_backend = "flashinfer_cutlass"
 
     validate_generation_batch_policy(
@@ -108,7 +162,6 @@ def create_longcat_next_text_executor(
         server_args=server_args,
     )
 
-    # ── SGLang infrastructure (model worker, pools, managers) ─────────
     want_cuda_graph, (
         model_worker,
         tree_cache,
@@ -125,24 +178,20 @@ def create_longcat_next_text_executor(
         model_arch_override="LongcatNextTextForCausalLM",
     )
 
-    # ── CUDA graph capture ─────────────────────────────────────────────
     if want_cuda_graph:
         model_worker.model_runner.init_device_graphs()
 
-    # ── Output processor ───────────────────────────────────────────────
     output_proc = SGLangOutputProcessor(
         capture_hidden=False,
         capture_hidden_layers=None,
         model=model_worker.model_runner.model,
     )
 
-    # ── Request / result adapters ──────────────────────────────────────
     request_builder, result_adapter = make_longcat_next_text_adapters(
         tokenizer=tokenizer,
         max_new_tokens=max_new_tokens,
     )
 
-    # ── Assemble OmniScheduler ─────────────────────────────────────────
     return OmniScheduler(
         tp_worker=model_worker,
         tree_cache=tree_cache,
@@ -152,7 +201,7 @@ def create_longcat_next_text_executor(
         model_config=model_config,
         prefill_manager=prefill_mgr,
         decode_manager=decode_mgr,
-        model_runner=ModelRunner(model_worker, output_proc),
+        model_runner=LongcatNextModelRunner(model_worker, output_proc),
         request_builder=request_builder,
         result_adapter=result_adapter,
     )
@@ -164,6 +213,10 @@ def create_longcat_next_executor(*args: Any, **kwargs: Any):
 
 
 __all__ = [
+    "create_preprocessing_executor",
+    "create_aggregate_executor",
+    "create_image_encoder_executor",
+    "create_audio_encoder_executor",
     "create_longcat_next_text_executor",
     "create_longcat_next_executor",
 ]

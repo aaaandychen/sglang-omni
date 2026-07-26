@@ -1,0 +1,40 @@
+{
+    "bos_token_id": 1,
+    "eos_token_id": 2,
+    "pad_token_id": 3,
+
+    "max_new_tokens": 2048,
+    "do_sample": true,
+    "temperature": 0.4,
+    "top_k": 20,
+    "top_p": 0.85,
+    "repetition_penalty": 1.1,
+
+    "visual_generation_config": {
+        "do_sample": true,
+        "temperature": 0.5,
+        "top_p": 0.75,
+        "top_k": 1024,
+        "custom_params": {
+            "cfg_scale": 3.0,
+            "token_h": 37,
+            "token_w": 37,
+            "anyres_prefix": "<longcat_img_token_size>{h} {w}</longcat_img_token_size>"
+        }
+    },
+
+    "audio_generation_config": {
+        "audio_parallel_decoding": false,
+        "do_sample": true,
+        "temperature": 0.5,
+        "top_k": 5,
+        "top_p": 0.85,
+        "repetition_penalty": 1.3,
+        "custom_params": {
+            "sampling_rate": 24000,
+            "wave_concat_overlap": 1200
+        }
+    },
+
+    "transformers_version": "4.57.6"
+}
