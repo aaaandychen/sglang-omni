@@ -8,16 +8,36 @@ from typing import Any
 import torch
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.models.longcat_next.payload_types import longcat_log_timing, longcat_timing
 
 
 class LongcatNextModelRunner(ModelRunner):
     """Attach multimodal replacement tensors to ForwardBatch during prefill."""
+
+    def execute(self, scheduler_output: Any):
+        batch = getattr(scheduler_output, "batch_data", None)
+        forward_mode = getattr(batch, "forward_mode", None)
+        phase = "prefill" if forward_mode is not None and forward_mode.is_extend() else "decode"
+        reqs = getattr(batch, "reqs", []) if batch is not None else []
+        with longcat_timing(
+            "text_ar_execute",
+            phase=phase,
+            batch_size=len(reqs),
+        ):
+            return super().execute(scheduler_output)
 
     def before_prefill(self, forward_batch: Any, schedule_batch: Any, requests: list) -> None:
         del requests
         if not schedule_batch.forward_mode.is_extend():
             return
 
+        with longcat_timing(
+            "text_ar_before_prefill_mm_injection",
+            batch_size=len(getattr(schedule_batch, "reqs", []) or []),
+        ):
+            self._attach_multimodal_replacements(forward_batch, schedule_batch)
+
+    def _attach_multimodal_replacements(self, forward_batch: Any, schedule_batch: Any) -> None:
         device = forward_batch.input_ids.device
         raw_extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if raw_extend_lens is None:
@@ -85,6 +105,11 @@ class LongcatNextModelRunner(ModelRunner):
         if replace_embeds_parts:
             forward_batch.longcat_replace_embeds = torch.cat(replace_embeds_parts, dim=0)
             forward_batch.longcat_replace_positions = torch.cat(replace_positions_parts, dim=0)
+            longcat_log_timing(
+                "text_ar_mm_replacements_attached",
+                replace_tokens=int(forward_batch.longcat_replace_positions.numel()),
+                device=device,
+            )
         else:
             forward_batch.longcat_replace_embeds = None
             forward_batch.longcat_replace_positions = None

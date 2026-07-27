@@ -15,6 +15,7 @@ from sglang_omni.models.longcat_next.payload_types import (
     AUDIO_STAGE,
     IMAGE_STAGE,
     LongcatNextPipelineState,
+    longcat_timing,
     payload_with_state,
 )
 
@@ -30,16 +31,24 @@ class LongcatNextPreprocessor:
 
     def __init__(self, model_path: str):
         self.model_path = model_path
-        self.config = get_longcat_config(model_path)
-        self.processor = get_longcat_processor(model_path)
+        with longcat_timing("preprocessor_config_init"):
+            self.config = get_longcat_config(model_path)
+        with longcat_timing("preprocessor_processor_init"):
+            self.processor = get_longcat_processor(model_path)
         self.tokenizer = self.processor.tokenizer
 
     def __call__(self, payload):
-        text = self._build_processor_text(payload.request.inputs)
-        text_inputs, visual_inputs, audio_inputs = self.processor(
-            text,
-            return_tensors="pt",
-        )
+        with longcat_timing("preprocessor_build_text", request_id=payload.request_id):
+            text = self._build_processor_text(payload.request.inputs)
+        with longcat_timing(
+            "preprocessor_processor_call",
+            request_id=payload.request_id,
+            text_len=len(text),
+        ):
+            text_inputs, visual_inputs, audio_inputs = self.processor(
+                text,
+                return_tensors="pt",
+            )
         input_ids = text_inputs["input_ids"][0].to(torch.long)
 
         image_positions = (

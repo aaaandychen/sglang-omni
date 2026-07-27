@@ -40,6 +40,8 @@ from torch import nn
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.models.longcat_flash import LongcatFlashForCausalLM, LongcatFlashMoE
 
+from sglang_omni.models.longcat_next.payload_types import longcat_timing
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -267,28 +269,31 @@ class LongcatNextTextForCausalLM(LongcatFlashForCausalLM):
         the forward-batch aware forms first so Phase 1's token-table path stays
         active; fall back to the plain embedding call for non-ngram configs.
         """
-        embed_ids = input_ids
-        replace_positions = getattr(forward_batch, "longcat_replace_positions", None)
-        if replace_positions is not None and len(replace_positions) > 0:
-            embed_ids = input_ids.clone()
-            embed_ids[replace_positions.to(embed_ids.device)] = 0
+        with longcat_timing("build_input_embeds_pad_zero"):
+            embed_ids = input_ids
+            replace_positions = getattr(forward_batch, "longcat_replace_positions", None)
+            if replace_positions is not None and len(replace_positions) > 0:
+                embed_ids = input_ids.clone()
+                embed_ids[replace_positions.to(embed_ids.device)] = 0
 
-        embed_tokens = self.model.embed_tokens
-        try:
-            input_embeds = embed_tokens(embed_ids, forward_batch)
-        except TypeError:
+        with longcat_timing("build_input_embeds_ngram"):
+            embed_tokens = self.model.embed_tokens
             try:
-                input_embeds = embed_tokens(embed_ids, forward_batch=forward_batch)
+                input_embeds = embed_tokens(embed_ids, forward_batch)
             except TypeError:
-                input_embeds = embed_tokens(embed_ids)
+                try:
+                    input_embeds = embed_tokens(embed_ids, forward_batch=forward_batch)
+                except TypeError:
+                    input_embeds = embed_tokens(embed_ids)
 
-        replace_embeds = getattr(forward_batch, "longcat_replace_embeds", None)
-        if replace_positions is not None and replace_embeds is not None:
-            pos = replace_positions.to(input_embeds.device)
-            input_embeds[pos] = replace_embeds.to(
-                device=input_embeds.device,
-                dtype=input_embeds.dtype,
-            )
+        with longcat_timing("build_input_embeds_scatter"):
+            replace_embeds = getattr(forward_batch, "longcat_replace_embeds", None)
+            if replace_positions is not None and replace_embeds is not None:
+                pos = replace_positions.to(input_embeds.device)
+                input_embeds[pos] = replace_embeds.to(
+                    device=input_embeds.device,
+                    dtype=input_embeds.dtype,
+                )
         return input_embeds
 
     @torch.no_grad()

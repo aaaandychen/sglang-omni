@@ -12,6 +12,7 @@ from sglang_omni.models.longcat_next.components.dynamic import (
     get_longcat_config,
     get_longcat_remote_class,
 )
+from sglang_omni.models.longcat_next.payload_types import longcat_timing
 from sglang_omni.models.weight_loader import (
     load_module,
     load_weights_by_prefix,
@@ -46,16 +47,17 @@ class _OffsetCodebookEmbedding(nn.Module):
         dtype: torch.dtype,
     ) -> None:
         super().__init__()
-        state = load_weights_by_prefix(model_path, prefix="model.embed_tokens.")
-        weight = state["weight"]
-        layers = []
-        start = int(offset)
-        for size in codebook_sizes:
-            stop = start + int(size)
-            emb_weight = weight[start:stop].to(dtype=dtype)
-            layers.append(nn.Embedding.from_pretrained(emb_weight, freeze=True))
-            start = stop
-        self.layers = nn.ModuleList(layers).to(device=device, dtype=dtype)
+        with longcat_timing("codebook_embedding_load", device=device, offset=offset):
+            state = load_weights_by_prefix(model_path, prefix="model.embed_tokens.")
+            weight = state["weight"]
+            layers = []
+            start = int(offset)
+            for size in codebook_sizes:
+                stop = start + int(size)
+                emb_weight = weight[start:stop].to(dtype=dtype)
+                layers.append(nn.Embedding.from_pretrained(emb_weight, freeze=True))
+                start = stop
+            self.layers = nn.ModuleList(layers).to(device=device, dtype=dtype)
 
     @torch.no_grad()
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
@@ -81,20 +83,23 @@ class LongcatNextImageEncoder(nn.Module):
         super().__init__()
         torch_dtype = resolve_dtype(dtype) or torch.bfloat16
         self.model_path = model_path
-        self.config = get_longcat_config(model_path)
-        visual_cls = get_longcat_remote_class(
-            model_path,
-            "modular_longcat_next_visual.LongcatNextVisualTokenizer",
-        )
+        with longcat_timing("image_encoder_config_init", device=device, dtype=torch_dtype):
+            self.config = get_longcat_config(model_path)
+        with longcat_timing("image_encoder_remote_class_init"):
+            visual_cls = get_longcat_remote_class(
+                model_path,
+                "modular_longcat_next_visual.LongcatNextVisualTokenizer",
+            )
         self.visual_tokenizer = visual_cls(self.config)
-        self.visual_tokenizer = load_module(
-            self.visual_tokenizer,
-            model_path,
-            prefix="model.visual_tokenizer.",
-            dtype=torch_dtype,
-            device=device,
-            strict=True,
-        )
+        with longcat_timing("image_encoder_load_module", device=device, dtype=torch_dtype):
+            self.visual_tokenizer = load_module(
+                self.visual_tokenizer,
+                model_path,
+                prefix="model.visual_tokenizer.",
+                dtype=torch_dtype,
+                device=device,
+                strict=True,
+            )
         self.codebook_embedding = _OffsetCodebookEmbedding(
             model_path=model_path,
             offset=int(self.config.visual_offset),
@@ -107,11 +112,15 @@ class LongcatNextImageEncoder(nn.Module):
     @torch.no_grad()
     def forward(self, pixel_values: torch.Tensor, visual_grid_thw: torch.Tensor) -> dict[str, torch.Tensor]:
         device = next(self.visual_tokenizer.parameters()).device
-        pixel_values = pixel_values.to(device=device)
-        visual_grid_thw = visual_grid_thw.to(device=device)
-        visual_ids = self.visual_tokenizer.encode(pixel_values, visual_grid_thw)
-        visual_embeds = self.codebook_embedding(visual_ids)
-        visual_embeds = self.visual_tokenizer.visual_embedding_layer(visual_embeds)
+        with longcat_timing("image_encoder_h2d", device=device):
+            pixel_values = pixel_values.to(device=device)
+            visual_grid_thw = visual_grid_thw.to(device=device)
+        with longcat_timing("image_encoder_tokenize", device=device):
+            visual_ids = self.visual_tokenizer.encode(pixel_values, visual_grid_thw)
+        with longcat_timing("image_encoder_codebook_embedding", device=device):
+            visual_embeds = self.codebook_embedding(visual_ids)
+        with longcat_timing("image_encoder_projection", device=device):
+            visual_embeds = self.visual_tokenizer.visual_embedding_layer(visual_embeds)
         return {
             "visual_ids": visual_ids.detach(),
             "visual_embeds": visual_embeds.reshape(-1, visual_embeds.shape[-1]).detach(),
@@ -131,20 +140,23 @@ class LongcatNextAudioEncoder(nn.Module):
         super().__init__()
         torch_dtype = resolve_dtype(dtype) or torch.bfloat16
         self.model_path = model_path
-        self.config = get_longcat_config(model_path)
-        audio_cls = get_longcat_remote_class(
-            model_path,
-            "modular_longcat_next_audio.LongcatNextAudioTokenizer",
-        )
+        with longcat_timing("audio_encoder_config_init", device=device, dtype=torch_dtype):
+            self.config = get_longcat_config(model_path)
+        with longcat_timing("audio_encoder_remote_class_init"):
+            audio_cls = get_longcat_remote_class(
+                model_path,
+                "modular_longcat_next_audio.LongcatNextAudioTokenizer",
+            )
         self.audio_tokenizer = audio_cls(self.config)
-        self.audio_tokenizer = load_module(
-            self.audio_tokenizer,
-            model_path,
-            prefix="model.audio_tokenizer.",
-            dtype=torch_dtype,
-            device=device,
-            strict=True,
-        )
+        with longcat_timing("audio_encoder_load_module", device=device, dtype=torch_dtype):
+            self.audio_tokenizer = load_module(
+                self.audio_tokenizer,
+                model_path,
+                prefix="model.audio_tokenizer.",
+                dtype=torch_dtype,
+                device=device,
+                strict=True,
+            )
         self.codebook_embedding = _OffsetCodebookEmbedding(
             model_path=model_path,
             offset=int(self.config.audio_offset),
@@ -162,11 +174,14 @@ class LongcatNextAudioEncoder(nn.Module):
         bridge_length: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         device = next(self.audio_tokenizer.parameters()).device
-        audio = audio.to(device=device)
-        encoder_length = encoder_length.to(device=device)
-        bridge_length = bridge_length.to(device=device)
-        audio_ids = self.audio_tokenizer.encode(audio, encoder_length, bridge_length)
-        audio_embeds = self.codebook_embedding(audio_ids)
+        with longcat_timing("audio_encoder_h2d", device=device):
+            audio = audio.to(device=device)
+            encoder_length = encoder_length.to(device=device)
+            bridge_length = bridge_length.to(device=device)
+        with longcat_timing("audio_encoder_tokenize", device=device):
+            audio_ids = self.audio_tokenizer.encode(audio, encoder_length, bridge_length)
+        with longcat_timing("audio_encoder_codebook_embedding", device=device):
+            audio_embeds = self.codebook_embedding(audio_ids)
         return {
             "audio_ids": audio_ids.detach(),
             "audio_embeds": audio_embeds.reshape(-1, audio_embeds.shape[-1]).detach(),

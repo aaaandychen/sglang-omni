@@ -10,6 +10,7 @@ from sglang_omni.models.longcat_next.payload_types import (
     IMAGE_STAGE,
     LongcatNextPipelineState,
     PREPROCESSING_STAGE,
+    longcat_timing,
     payload_with_state,
 )
 from sglang_omni.proto import StagePayload
@@ -22,6 +23,11 @@ def _state(payload: StagePayload | None) -> LongcatNextPipelineState:
 
 def merge_for_text_ar(payloads: dict[str, StagePayload]) -> StagePayload:
     """Aggregate preprocessing + encoder outputs into text_ar payload."""
+    with longcat_timing("merge_for_text_ar", num_sources=len(payloads)):
+        return _merge_for_text_ar(payloads)
+
+
+def _merge_for_text_ar(payloads: dict[str, StagePayload]) -> StagePayload:
     pre_payload = payloads[PREPROCESSING_STAGE]
     pre = _state(pre_payload)
     image = _state(payloads.get(IMAGE_STAGE))

@@ -15,6 +15,7 @@ from sglang_omni.models.longcat_next.payload_types import (
     IMAGE_STAGE,
     LongcatNextPipelineState,
     PREPROCESSING_STAGE,
+    longcat_timing,
     payload_with_state,
 )
 from sglang_omni.proto import StagePayload
@@ -169,6 +170,11 @@ def make_longcat_next_text_adapters(
     suppress_tokens = _build_suppress_tokens(tokenizer)
 
     def request_builder(payload: StagePayload) -> SGLangARRequestData:
+        with longcat_timing("text_ar_request_build", request_id=payload.request_id):
+            return _build_request(payload)
+
+
+    def _build_request(payload: StagePayload) -> SGLangARRequestData:
         params: dict[str, Any] = dict(payload.request.params or {})
         state = _payload_state(payload)
         text_ar_inputs = state.text_ar_inputs or {}

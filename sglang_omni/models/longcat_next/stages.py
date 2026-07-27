@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from sglang_omni.models.longcat_next.payload_types import longcat_timing
+
 
 def create_preprocessing_executor(model_path: str):
     from sglang_omni.models.longcat_next.components.preprocessor import (
@@ -12,10 +14,12 @@ def create_preprocessing_executor(model_path: str):
     )
     from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
-    preprocessor = LongcatNextPreprocessor(model_path)
+    with longcat_timing("preprocessing_executor_init"):
+        preprocessor = LongcatNextPreprocessor(model_path)
 
     def _preprocess(payload):
-        return preprocessor(payload)
+        with longcat_timing("preprocessing_request", request_id=payload.request_id):
+            return preprocessor(payload)
 
     return SimpleScheduler(_preprocess)
 
@@ -24,7 +28,8 @@ def create_aggregate_executor():
     from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
     def _identity(payload):
-        return payload
+        with longcat_timing("mm_aggregate_request", request_id=payload.request_id):
+            return payload
 
     return SimpleScheduler(_identity)
 
@@ -45,20 +50,22 @@ def create_image_encoder_executor(
     )
     from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
-    model = LongcatNextImageEncoder(model_path, device=device, dtype=dtype)
+    with longcat_timing("image_encoder_executor_init", device=device, dtype=dtype):
+        model = LongcatNextImageEncoder(model_path, device=device, dtype=dtype)
 
     def _encode(payload):
-        state = LongcatNextPipelineState.from_dict(payload.data)
-        inputs = state.encoder_inputs.get(IMAGE_STAGE) or {}
-        if not inputs:
-            state.encoder_outs[IMAGE_STAGE] = {}
+        with longcat_timing("image_encoder_request", request_id=payload.request_id):
+            state = LongcatNextPipelineState.from_dict(payload.data)
+            inputs = state.encoder_inputs.get(IMAGE_STAGE) or {}
+            if not inputs:
+                state.encoder_outs[IMAGE_STAGE] = {}
+                return payload_with_state(payload, state)
+            result = model(
+                pixel_values=inputs["pixel_values"],
+                visual_grid_thw=inputs["visual_grid_thw"],
+            )
+            state.encoder_outs[IMAGE_STAGE] = result
             return payload_with_state(payload, state)
-        result = model(
-            pixel_values=inputs["pixel_values"],
-            visual_grid_thw=inputs["visual_grid_thw"],
-        )
-        state.encoder_outs[IMAGE_STAGE] = result
-        return payload_with_state(payload, state)
 
     return SimpleScheduler(_encode)
 
@@ -79,21 +86,23 @@ def create_audio_encoder_executor(
     )
     from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
-    model = LongcatNextAudioEncoder(model_path, device=device, dtype=dtype)
+    with longcat_timing("audio_encoder_executor_init", device=device, dtype=dtype):
+        model = LongcatNextAudioEncoder(model_path, device=device, dtype=dtype)
 
     def _encode(payload):
-        state = LongcatNextPipelineState.from_dict(payload.data)
-        inputs = state.encoder_inputs.get(AUDIO_STAGE) or {}
-        if not inputs:
-            state.encoder_outs[AUDIO_STAGE] = {}
+        with longcat_timing("audio_encoder_request", request_id=payload.request_id):
+            state = LongcatNextPipelineState.from_dict(payload.data)
+            inputs = state.encoder_inputs.get(AUDIO_STAGE) or {}
+            if not inputs:
+                state.encoder_outs[AUDIO_STAGE] = {}
+                return payload_with_state(payload, state)
+            result = model(
+                audio=inputs["audio"],
+                encoder_length=inputs["encoder_length"],
+                bridge_length=inputs["bridge_length"],
+            )
+            state.encoder_outs[AUDIO_STAGE] = result
             return payload_with_state(payload, state)
-        result = model(
-            audio=inputs["audio"],
-            encoder_length=inputs["encoder_length"],
-            bridge_length=inputs["bridge_length"],
-        )
-        state.encoder_outs[AUDIO_STAGE] = result
-        return payload_with_state(payload, state)
 
     return SimpleScheduler(_encode)
 
@@ -134,7 +143,8 @@ def create_longcat_next_text_executor(
     )
 
     gpu_id = int(device.split(":")[-1]) if ":" in device else tp_rank
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    with longcat_timing("text_ar_tokenizer_init", tp_rank=tp_rank, device=device):
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
     overrides = build_generation_batch_overrides(
         max_running_requests=max_running_requests,
@@ -149,12 +159,13 @@ def create_longcat_next_text_executor(
         dtype=dtype,
     )
 
-    server_args = build_sglang_server_args(
-        model_path,
-        context_length=context_length,
-        tp_size=tp_size,
-        **overrides,
-    )
+    with longcat_timing("text_ar_server_args_build", tp_rank=tp_rank, device=device):
+        server_args = build_sglang_server_args(
+            model_path,
+            context_length=context_length,
+            tp_size=tp_size,
+            **overrides,
+        )
     server_args.moe_runner_backend = "flashinfer_cutlass"
 
     validate_generation_batch_policy(
@@ -162,35 +173,39 @@ def create_longcat_next_text_executor(
         server_args=server_args,
     )
 
-    want_cuda_graph, (
-        model_worker,
-        tree_cache,
-        req_to_token_pool,
-        token_to_kv_pool_allocator,
-        prefill_mgr,
-        decode_mgr,
-        model_config,
-    ) = create_sglang_infrastructure_defer_cuda_graph(
-        server_args,
-        gpu_id,
-        tp_rank=tp_rank,
-        nccl_port=nccl_port,
-        model_arch_override="LongcatNextTextForCausalLM",
-    )
+    with longcat_timing("text_ar_infrastructure_init", tp_rank=tp_rank, gpu_id=gpu_id):
+        want_cuda_graph, (
+            model_worker,
+            tree_cache,
+            req_to_token_pool,
+            token_to_kv_pool_allocator,
+            prefill_mgr,
+            decode_mgr,
+            model_config,
+        ) = create_sglang_infrastructure_defer_cuda_graph(
+            server_args,
+            gpu_id,
+            tp_rank=tp_rank,
+            nccl_port=nccl_port,
+            model_arch_override="LongcatNextTextForCausalLM",
+        )
 
     if want_cuda_graph:
-        model_worker.model_runner.init_device_graphs()
+        with longcat_timing("text_ar_cuda_graph_init", tp_rank=tp_rank, gpu_id=gpu_id):
+            model_worker.model_runner.init_device_graphs()
 
-    output_proc = SGLangOutputProcessor(
-        capture_hidden=False,
-        capture_hidden_layers=None,
-        model=model_worker.model_runner.model,
-    )
+    with longcat_timing("text_ar_output_processor_init", tp_rank=tp_rank):
+        output_proc = SGLangOutputProcessor(
+            capture_hidden=False,
+            capture_hidden_layers=None,
+            model=model_worker.model_runner.model,
+        )
 
-    request_builder, result_adapter = make_longcat_next_text_adapters(
-        tokenizer=tokenizer,
-        max_new_tokens=max_new_tokens,
-    )
+    with longcat_timing("text_ar_request_adapters_init", tp_rank=tp_rank):
+        request_builder, result_adapter = make_longcat_next_text_adapters(
+            tokenizer=tokenizer,
+            max_new_tokens=max_new_tokens,
+        )
 
     return OmniScheduler(
         tp_worker=model_worker,
