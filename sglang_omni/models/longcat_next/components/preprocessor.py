@@ -112,7 +112,14 @@ class LongcatNextPreprocessor:
         elif isinstance(inputs.get("prompt"), str):
             text = inputs["prompt"]
         elif isinstance(inputs.get("messages"), list):
-            text = self._messages_to_text(inputs["messages"])
+            try:
+                text = self.tokenizer.apply_chat_template(
+                    inputs["messages"],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except (AttributeError, ValueError):
+                text = self._messages_to_text(inputs["messages"])
         else:
             text = ""
 

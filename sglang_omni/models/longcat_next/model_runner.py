@@ -45,9 +45,11 @@ class LongcatNextModelRunner(ModelRunner):
             # Global start in the original request sequence for this EXTEND
             # chunk.  In non-chunked prefill this is 0; in chunked prefill it
             # equals the prefix length already resident in KV cache.
-            chunk_global_start = len(getattr(req, "prefix_indices", []) or [])
+            _prefix = getattr(req, "prefix_indices", None)
+            chunk_global_start = len(_prefix) if _prefix is not None and _prefix.numel() > 0 else 0
             chunk_global_end = chunk_global_start + chunk_len
-            consumed = getattr(req, "_longcat_mm_consumed", None) or {}
+            _consumed = getattr(req, "_longcat_mm_consumed", None)
+            consumed = _consumed if _consumed is not None else {}
 
             for key in ("image", "audio"):
                 embeds = mm.get(f"{key}_embeds")

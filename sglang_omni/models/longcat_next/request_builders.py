@@ -221,13 +221,22 @@ def make_longcat_next_text_adapters(
         payload = data.stage_payload
         output_ids = list(data.output_ids or [])
         text = tokenizer.decode(output_ids, skip_special_tokens=True)
+        prompt_tokens = 0
+        sgl_req = getattr(data, "req", None)
+        if sgl_req is not None:
+            origin_ids = getattr(sgl_req, "origin_input_ids", None)
+            if origin_ids is not None:
+                prompt_tokens = len(origin_ids)
         return StagePayload(
             request_id=payload.request_id,
             request=payload.request,
             data={
                 "text": text,
                 "modality": "text",
-                "usage": {"output_tokens": len(output_ids)},
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": len(output_ids),
+                },
             },
         )
 
