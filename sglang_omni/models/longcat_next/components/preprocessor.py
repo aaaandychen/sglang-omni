@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -38,6 +39,8 @@ class LongcatNextPreprocessor:
         self.tokenizer = self.processor.tokenizer
 
     def __call__(self, payload):
+        image_paths, audio_paths = self._extract_media_paths(payload.request.inputs)
+
         with longcat_timing("preprocessor_build_text", request_id=payload.request_id):
             text = self._build_processor_text(payload.request.inputs)
         with longcat_timing(
@@ -82,6 +85,7 @@ class LongcatNextPreprocessor:
                 "pixel_values": vi.get("pixel_values"),
                 "visual_grid_thw": visual_grid_thw,
                 "image_positions": image_positions,
+                "cache_key": self._build_media_cache_key(image_paths),
             }
 
         if audio_inputs is not None and audio_positions.numel() > 0:
@@ -95,6 +99,7 @@ class LongcatNextPreprocessor:
                     "encoder_length": encoder_length,
                     "bridge_length": bridge_length,
                     "audio_positions": audio_positions,
+                    "cache_key": self._build_media_cache_key(audio_paths),
                 }
 
         state = LongcatNextPipelineState(
@@ -137,6 +142,55 @@ class LongcatNextPreprocessor:
         for audio in inputs.get("audios") or []:
             text += f"\n{self.processor.audio_start_token}{audio}{self.processor.audio_end_token}"
         return text
+
+    @staticmethod
+    def _extract_media_paths(inputs: Any) -> tuple[list[str], list[str]]:
+        """Extract image and audio file paths from request inputs.
+
+        Returns two lists (image_paths, audio_paths).  Only local file
+        paths (strings that do NOT start with ``http://``, ``https://``,
+        or ``data:``) are returned.  Bytes, base64 data URIs, and remote
+        URLs are silently skipped — the encoder cache only covers local
+        files for now.
+        """
+        if not isinstance(inputs, dict):
+            return [], []
+        images = inputs.get("images") or []
+        audios = inputs.get("audios") or []
+
+        def _is_local_path(value: Any) -> bool:
+            if not isinstance(value, str):
+                return False
+            return not (
+                value.startswith("http://")
+                or value.startswith("https://")
+                or value.startswith("data:")
+            )
+
+        image_paths = [img for img in images if _is_local_path(img)]
+        audio_paths = [aud for aud in audios if _is_local_path(aud)]
+        return image_paths, audio_paths
+
+
+    @staticmethod
+    def _build_media_cache_key(paths: list[str]) -> str | None:
+        """Build a deterministic cache key from file paths.
+
+        Uses ``path + size + mtime_ns`` so same-path-different-content is
+        treated as a cache miss.  Returns ``None`` when any file is
+        unreadable (OSError) — cache is skipped for safety.
+        """
+        if not paths:
+            return None
+        parts: list[str] = []
+        for p in paths:
+            try:
+                st = os.stat(p)
+                parts.append(f"{p}:{st.st_size}:{st.st_mtime_ns}")
+            except OSError:
+                return None
+        return "|".join(parts)
+
 
     @staticmethod
     def _messages_to_text(messages: list[Any]) -> str:

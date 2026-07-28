@@ -39,6 +39,9 @@ def _merge_for_text_ar(payloads: dict[str, StagePayload]) -> StagePayload:
     if input_ids is None:
         raise ValueError("LongCat-Next merge missing input_ids from preprocessing")
 
+    # encoder states are projected via project_encoder_to_mm_aggregate, which
+    # wraps encoder_outs in {IMAGE_STAGE/AUDIO_STAGE: {...}}, so the path is
+    # image.encoder_outs[IMAGE_STAGE] — the outer key matches the inner key.
     image_out = image.encoder_outs.get(IMAGE_STAGE, {})
     audio_out = audio.encoder_outs.get(AUDIO_STAGE, {})
 

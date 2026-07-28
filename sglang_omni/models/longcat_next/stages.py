@@ -5,7 +5,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from sglang_omni.models.longcat_next.payload_types import longcat_timing
+from sglang_omni.models.longcat_next.payload_types import longcat_log_timing, longcat_timing
+from sglang_omni.scheduling.stage_cache import StageOutputCache
+
+_ENCODER_CACHE_MAX_SIZE = 256
+_ENCODER_CACHE_MAX_BYTES = 1024 * 1024 * 1024  # 1 GiB
 
 
 def create_preprocessing_executor(model_path: str):
@@ -52,6 +56,11 @@ def create_image_encoder_executor(
 
     with longcat_timing("image_encoder_executor_init", device=device, dtype=dtype):
         model = LongcatNextImageEncoder(model_path, device=device, dtype=dtype)
+    cache = StageOutputCache(
+        max_size=_ENCODER_CACHE_MAX_SIZE,
+        max_bytes=_ENCODER_CACHE_MAX_BYTES,
+        cache_device=None,
+    )
 
     def _encode(payload):
         with longcat_timing("image_encoder_request", request_id=payload.request_id):
@@ -60,11 +69,44 @@ def create_image_encoder_executor(
             if not inputs:
                 state.encoder_outs[IMAGE_STAGE] = {}
                 return payload_with_state(payload, state)
+
+            cache_key = inputs.get("cache_key")
+            if cache_key:
+                cached = cache.get(cache_key)
+                if cached is not None:
+                    longcat_log_timing(
+                        "encoder_cache",
+                        stage=IMAGE_STAGE,
+                        action="hit",
+                        cache_key=cache_key,
+                        request_id=payload.request_id,
+                    )
+                    state.encoder_outs[IMAGE_STAGE] = cached
+                    return payload_with_state(payload, state)
+                longcat_log_timing(
+                    "encoder_cache",
+                    stage=IMAGE_STAGE,
+                    action="miss",
+                    cache_key=cache_key,
+                    request_id=payload.request_id,
+                )
+
             result = model(
                 pixel_values=inputs["pixel_values"],
                 visual_grid_thw=inputs["visual_grid_thw"],
             )
             state.encoder_outs[IMAGE_STAGE] = result
+
+            if cache_key:
+                cache.put(cache_key, result)
+                longcat_log_timing(
+                    "encoder_cache",
+                    stage=IMAGE_STAGE,
+                    action="store",
+                    cache_key=cache_key,
+                    request_id=payload.request_id,
+                )
+
             return payload_with_state(payload, state)
 
     return SimpleScheduler(_encode)
@@ -88,6 +130,11 @@ def create_audio_encoder_executor(
 
     with longcat_timing("audio_encoder_executor_init", device=device, dtype=dtype):
         model = LongcatNextAudioEncoder(model_path, device=device, dtype=dtype)
+    cache = StageOutputCache(
+        max_size=_ENCODER_CACHE_MAX_SIZE,
+        max_bytes=_ENCODER_CACHE_MAX_BYTES,
+        cache_device=None,
+    )
 
     def _encode(payload):
         with longcat_timing("audio_encoder_request", request_id=payload.request_id):
@@ -96,12 +143,45 @@ def create_audio_encoder_executor(
             if not inputs:
                 state.encoder_outs[AUDIO_STAGE] = {}
                 return payload_with_state(payload, state)
+
+            cache_key = inputs.get("cache_key")
+            if cache_key:
+                cached = cache.get(cache_key)
+                if cached is not None:
+                    longcat_log_timing(
+                        "encoder_cache",
+                        stage=AUDIO_STAGE,
+                        action="hit",
+                        cache_key=cache_key,
+                        request_id=payload.request_id,
+                    )
+                    state.encoder_outs[AUDIO_STAGE] = cached
+                    return payload_with_state(payload, state)
+                longcat_log_timing(
+                    "encoder_cache",
+                    stage=AUDIO_STAGE,
+                    action="miss",
+                    cache_key=cache_key,
+                    request_id=payload.request_id,
+                )
+
             result = model(
                 audio=inputs["audio"],
                 encoder_length=inputs["encoder_length"],
                 bridge_length=inputs["bridge_length"],
             )
             state.encoder_outs[AUDIO_STAGE] = result
+
+            if cache_key:
+                cache.put(cache_key, result)
+                longcat_log_timing(
+                    "encoder_cache",
+                    stage=AUDIO_STAGE,
+                    action="store",
+                    cache_key=cache_key,
+                    request_id=payload.request_id,
+                )
+
             return payload_with_state(payload, state)
 
     return SimpleScheduler(_encode)

@@ -65,7 +65,7 @@ class _OffsetCodebookEmbedding(nn.Module):
         out = None
         for i, layer in enumerate(self.layers):
             part = layer(ids[..., i].to(layer.weight.device))
-            out = part if out is None else out + part
+        out = part if out is None else out + part.to(out.device)
         assert out is not None
         return out
 
