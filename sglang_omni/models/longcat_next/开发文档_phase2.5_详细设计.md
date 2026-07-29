@@ -188,3 +188,98 @@ hit 时所有 encoder 子步骤（h2d/tokenize/codebook_embedding/projection）�
 ## Milestone E：CUDA Graph / async decode 🔜 待开发
 
 （见 `开发文档_phase2.5_milestones.md` Step 4-5）
+
+---
+
+## 附录：API 请求格式
+
+### 纯文本
+
+```bash
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "/path/to/LongCat-Next",
+    "messages": [{"role": "user", "content": "Hello, who are you?"}],
+    "max_tokens": 1000
+  }'
+```
+
+### 图片
+
+图片通过顶级 `images` 字段传入（本地文件路径列表），prompt 中描述图片内容：
+
+```bash
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "/path/to/LongCat-Next",
+    "messages": [{"role": "user", "content": "Describe this image."}],
+    "images": ["/absolute/path/to/cars.jpg"],
+    "max_tokens": 1000
+  }'
+```
+
+### 音频
+
+音频通过顶级 `audios` 字段传入（本地文件路径列表）：
+
+```bash
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "/path/to/LongCat-Next",
+    "messages": [{"role": "user", "content": "What do you hear?"}],
+    "audios": ["/absolute/path/to/audio.wav"],
+    "max_tokens": 1000
+  }'
+```
+
+### 图片 + 音频混合
+
+```bash
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "/path/to/LongCat-Next",
+    "messages": [{"role": "user", "content": "Describe the image and audio together."}],
+    "images": ["/absolute/path/to/cars.jpg"],
+    "audios": ["/absolute/path/to/cough.wav"],
+    "max_tokens": 1000
+  }'
+```
+
+### 关键说明
+
+- `images` 和 `audios` 是 **ChatCompletionRequest 的顶级字段**，不是消息 content 中的嵌套类型
+- Content 中的 `image_url` / `audio_url` 类型仅参与 prompt 文本拼接，**不会触发实际的媒体编解码**
+- 路径必须是服务进程可访问的本地文件路径
+- 多图/多音频在数组中列出即可，各文件分别处理
+
+---
+
+## 附录：CUDA 12.9 兼容性适配（gpu_compat.py）
+
+### 问题 1：kernels HF hub cu129 回退
+
+`transformers==5.6.0` 通过 `kernels` 包从 HuggingFace Hub 拉取预编译的 flash-attn2 kernel，但 `kernels-community/flash-attn2` 仓库没有 `torch211-cxx11-cu129` 构建。CUDA 12.8 kernel 在 12.9 运行时上二进制兼容。
+
+**修复**：`_patch_kernels_cu129_fallback()` monkey-patch `kernels.utils.build_variants()`，为每个 cu129 variant 额外生成 cu128 回退项。
+
+### 问题 2：pip 传递依赖 `kernels` 版本漂移
+
+`sglang==0.5.12.post1` 对 `kernels` 无版本约束，`transformers==5.6.0` 需要 `kernels<0.13`。`uv sync` 时解析器安装了 `kernels==0.16.0`，其中 `LayerRepository.__init__` 新增了 `revision/version` 必填参数，导致 `hub_kernels.py` 在 import 时崩溃。
+
+**修复**：`pyproject.toml` `override-dependencies` 中添加 `kernels<0.13`。
+
+### 问题 3：`sgl-deep-gemm` CUDA 13→12.9 兼容
+
+`sglang==0.5.12.post1` 的硬依赖 `sgl-deep-gemm==0.1.0` 的 PyPI 版本 `_C.so` 链接 `libcudart.so.13`，在 CUDA 12.9 系统上无法加载。
+
+**修复**：`pyproject.toml` 中指定 `sgl-deep-gemm = { index = "sglang-cu129" }` 从 `https://docs.sglang.ai/whl/cu129` 获取 `0.1.0+cu129` 版本，链接 CUDA 12。
+
+### 问题 4：transformers 5.6.0 flash_attention_forward s_aux=None
+
+Qwen2.5-VL 视觉模型不使用 sliding window attention，`flash_attention_forward` 的 `s_aux` 参数为 None，但 transformers 5.6.0 未做 None 检查直接调用 `.to()`。
+
+**修复**：`_patch_flash_attn_s_aux_none()` monkey-patch，将 None 替换为空的 dummy tensor。

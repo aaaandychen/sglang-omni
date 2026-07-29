@@ -66,7 +66,7 @@ def create_image_encoder_executor(
         with longcat_timing("image_encoder_request", request_id=payload.request_id):
             state = LongcatNextPipelineState.from_dict(payload.data)
             inputs = state.encoder_inputs.get(IMAGE_STAGE) or {}
-            if not inputs:
+            if not inputs or inputs.get("pixel_values") is None:
                 state.encoder_outs[IMAGE_STAGE] = {}
                 return payload_with_state(payload, state)
 

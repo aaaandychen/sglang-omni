@@ -145,7 +145,53 @@ def apply_gpu_compat_env_defaults(
     for key, value in overrides.items():
         target_env[key] = value
         logger.info(f"Applied GPU compatibility env override: {key}={value}")
+    _patch_kernels_cu129_fallback()
+    _patch_flash_attn_s_aux_none()
     return overrides
+
+
+def _patch_kernels_cu129_fallback() -> None:
+    """Allow ``kernels`` HF hub lookups to fall back to cu128 builds on cu129 hosts."""
+    try:
+        from kernels import utils as kernels_utils
+    except ImportError:
+        return
+
+    _orig_build_variants = kernels_utils.build_variants
+
+    def _patched_build_variants() -> list[str]:
+        variants = _orig_build_variants()
+        extra = []
+        for v in variants:
+            v128 = v.replace("cu129", "cu128")
+            if v128 != v:
+                extra.append(v128)
+        return variants + extra
+
+    kernels_utils.build_variants = _patched_build_variants
+
+
+def _patch_flash_attn_s_aux_none() -> None:
+    """Workaround for transformers 5.6.0 flash_attention_forward bug.
+
+    The function unconditionally calls ``s_aux.to(query.dtype)`` but Qwen2.5-VL
+    visual encoder does not use sliding window attention and passes ``s_aux=None``.
+    Patch to replace None with a zero-size dummy tensor.
+    """
+    try:
+        import torch
+        from transformers.integrations import flash_attention as _fa_mod
+    except ImportError:
+        return
+
+    _orig = _fa_mod.flash_attention_forward
+
+    def _patched(*args, **kwargs):
+        if kwargs.get("s_aux") is None:
+            kwargs["s_aux"] = torch.empty(0, dtype=torch.float16, device="cuda")
+        return _orig(*args, **kwargs)
+
+    _fa_mod.flash_attention_forward = _patched
 
 
 def gpu_ids_support_p2p_mesh(

@@ -28,6 +28,11 @@ dependencies = [
     "fastapi>=0.110.0",       # OpenAI-compatible API adapter
     "uvicorn>=0.23.0",        # ASGI server for FastAPI
     "sglang==0.5.12.post1",
+    # Force cu129 variants to avoid PyPI cu13 wheels that break on CUDA 12.9.
+    # sglang 0.5.12.post1 depends on both at the same versions, so this is a
+    # safe pin — uv resolves the direct URL and sglang's requirement aligns.
+    "sglang-kernel @ https://github.com/sgl-project/whl/releases/download/v0.4.2.post2/sglang_kernel-0.4.2.post2+cu129-cp310-abi3-manylinux2014_x86_64.whl",
+    "sgl-deep-gemm @ https://github.com/sgl-project/whl/releases/download/v0.1.0/sgl_deep_gemm-0.1.0+cu129-py3-none-manylinux2014_x86_64.whl",
     "flash-attn-4>=4.0.0b9",  # sglang 0.5.12 dep; upper bound removed for compat
     "nixl",  # CUDA 12.9 compat; meta-package auto-selects cu12 variant
     "mooncake-transfer-engine>=0.3.10",  # CUDA 12.9 compat; generic wheel, no libcudart.so.13 needed
@@ -87,6 +92,7 @@ sgl-omni-router = "sglang_omni_router.serve:main"
 override-dependencies = [
     "protobuf>=6.31.1,<7.0.0",
     "cuda-python==12.9",
+    "kernels<0.13",  # 0.13+ breaks transformers 5.6.0 hub_kernels integration
 ]
 # Allow cross-index best-match so torch/torchvision/etc. resolve on the cu129
 # index while the rest come from the default index.
