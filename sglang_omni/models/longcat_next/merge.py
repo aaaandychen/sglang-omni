@@ -13,11 +13,23 @@ from sglang_omni.models.longcat_next.payload_types import (
     longcat_timing,
     payload_with_state,
 )
+from sglang_omni.pipeline.tensor_ref import is_tensor_ref_dict, tensor_ref_numel
 from sglang_omni.proto import StagePayload
 
 
 def _state(payload: StagePayload | None) -> LongcatNextPipelineState:
     return LongcatNextPipelineState.from_dict(payload.data if payload else {})
+
+
+def _non_empty(value: Any) -> bool:
+    """True when *value* is a non-empty tensor or TensorRef."""
+    if value is None:
+        return False
+    if is_tensor_ref_dict(value):
+        return tensor_ref_numel(value) > 0
+    if hasattr(value, "numel"):
+        return value.numel() > 0
+    return bool(value)
 
 
 

@@ -230,7 +230,7 @@ def create_longcat_next_text_executor(
         max_running_requests=max_running_requests,
         server_args_overrides=server_args_overrides,
         disable_cuda_graph=True,
-        disable_overlap_schedule=True,
+        disable_overlap_schedule=False,
         enable_torch_compile=enable_torch_compile,
         mem_fraction_static=mem_fraction_static,
         max_prefill_tokens=16384,

@@ -58,6 +58,21 @@ class LongcatNextPipelineConfig(PipelineConfig):
 
     model_path: str
     entry_stage: str = "preprocessing"
+
+    # TensorRef lazy relay: visual_embeds / audio_embeds bypass mm_aggregate
+    # so the CPU-side aggregate stage never materializes large tensors.
+    # Refs are created on the encoder→mm_aggregate hop with
+    # consumer_stage=text_ar; only text_ar resolves them to GPU tensors.
+    env_defaults: dict[str, str] = Field(
+        default_factory=lambda: {
+            "SGLANG_OMNI_ENABLE_TENSOR_REFS": "1",
+            "SGLANG_OMNI_TENSOR_REF_EDGES": (
+                "image_encoder:mm_aggregate:text_ar,"
+                "audio_encoder:mm_aggregate:text_ar"
+            ),
+            "SGLANG_OMNI_TENSOR_REF_PATHS": "visual_embeds,audio_embeds",
+        }
+    )
     stages: list[StageConfig] = Field(
         default_factory=lambda: [
             StageConfig(
