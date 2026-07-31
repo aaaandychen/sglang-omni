@@ -435,6 +435,34 @@ H200 端到端测试：纯文本、图片、音频、图片+音频四种请求�
 - **修复**：`model_runner.py` `before_prefill` 中 decode 分支显式设置 `forward_batch.longcat_replace_embeds = None` 和 `longcat_replace_positions = None`
 - **验证**：静态分析通过。EXTEND 路径在 `_attach_multimodal_replacements` 末尾 `else` 分支也显式设为 None，两端覆盖无遗漏
 
+### Debug-006：CUDA Graph vocab_size 不匹配 ✅ 已修复
+
+- **时间**：2026-07-31
+- **环境**：H200，CUDA Graph 开启
+- **现象**：CUDA graph capture 时报 `The size of tensor a (282624) must match the size of tensor b (131125)`
+
+#### 根因
+
+`config.json` 中 `vocab_size=131125`。但 ngram embedding 将 LM head 的实际输出扩展到了 `282624` 维。CUDA graph 的 `next_token_logits_buffer` 按 LM head 真实输出分配（282624），但 `LogitsProcessor.vocab_size` 仍为 131125。`_copy_logits_to_buffer` 中 `logits_buffer.copy_(logits[:, :self.vocab_size])` 两边维度不一致。
+
+#### 为什么 eager 模式不受影响
+
+eager 模式走 `_copy_logits_to_buffer` 的 `else` 分支（无 buffer），直接 `logits[:, :vocab_size].float()` 做 slice，不合 buffer 维度。CUDA graph 为性能预分配了固定 buffer，维度不匹配才暴露。
+
+#### 修复
+
+`stages.py` 中 `create_longcat_next_text_executor`，模型创建后从 `lm_head.weight` 计算真实 vocab_size，同步更新 `model_config.vocab_size` 和 `logits_processor.vocab_size`：
+
+```python
+_model = model_worker.model_runner.model
+_actual_vocab = int(_model.lm_head.weight.shape[0]) * getattr(_model.lm_head, "tp_size", 1)
+model_config.vocab_size = _actual_vocab
+_model.logits_processor.vocab_size = _actual_vocab
+```
+
+- **验证**：CUDA graph capture 成功，纯文本、图片请求正常。
+- **影响范围**：仅 CUDA Graph 路径。eager 模式走 else 分支不受影响。
+
 ---
 
 ## 附录：API 请求格式

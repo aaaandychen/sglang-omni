@@ -229,7 +229,7 @@ def create_longcat_next_text_executor(
     overrides = build_generation_batch_overrides(
         max_running_requests=max_running_requests,
         server_args_overrides=server_args_overrides,
-        disable_cuda_graph=True,
+        disable_cuda_graph=False,
         disable_overlap_schedule=False,
         enable_torch_compile=enable_torch_compile,
         mem_fraction_static=mem_fraction_static,
@@ -269,6 +269,14 @@ def create_longcat_next_text_executor(
             nccl_port=nccl_port,
             model_arch_override="LongcatNextTextForCausalLM",
         )
+
+    # After model init, the effective vocab size may differ from config.json
+    # due to ngram embedding expansion.  Update model_config AND the model's
+    # LogitsProcessor so the CUDA graph runner and logits path agree.
+    _model = model_worker.model_runner.model
+    _actual_vocab = int(_model.lm_head.weight.shape[0]) * getattr(_model.lm_head, "tp_size", 1)
+    model_config.vocab_size = _actual_vocab
+    _model.logits_processor.vocab_size = _actual_vocab
 
     if want_cuda_graph:
         with longcat_timing("text_ar_cuda_graph_init", tp_rank=tp_rank, gpu_id=gpu_id):
