@@ -710,11 +710,6 @@ class Stage:
             self._tp_fanout.fanout_work(payload)
         payload_for_scheduler = payload
         if tensor_refs_enabled():
-            _materialize_logger = logging.getLogger(__name__)
-            _materialize_logger.warning(
-                "_execute: stage=%s role=%s tensor_refs_enabled=True",
-                self.name, self.role,
-            )
             # TensorRef SHM blobs are single-resolve (read+unlink).
             # Only the leader materializes; follower ranks receive
             # the resolved payload through the scheduler's TP broadcast.

@@ -218,13 +218,7 @@ class LongcatNextTextForCausalLM(LongcatFlashForCausalLM):
                 config, quant_config=quant_config, prefix=prefix
             )
         finally:
-            # After parent init, the actual LM head weight may be larger
-            # than config.vocab_size due to ngram embedding expansion.
-            # Weight is TP-sharded, so global_vocab = per_rank_vocab * tp_size.
-            lm_weight = self.lm_head.weight
-            per_rank_vocab = int(lm_weight.shape[0])
-            tp_size = getattr(self.lm_head, "tp_size", 1)
-            config.vocab_size = per_rank_vocab * tp_size
+            config.vocab_size = saved_vocab
 
         # lm_head is already created by the parent with
         # config.vocab_size = full_vocab (131125) — no replacement needed.

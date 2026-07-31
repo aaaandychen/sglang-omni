@@ -23,7 +23,6 @@ _PENDING_PUTS: dict[str, ShmPutOperation] = {}
 def _register_shm_put(op: "ShmPutOperation") -> None:
     shm_name = op._shm_obj.name
     _PENDING_PUTS[shm_name] = op
-    logger.warning("_register_shm_put: %s (total pending: %d)", shm_name, len(_PENDING_PUTS))
 
 
 def _unregister_shm_put(shm_name: str) -> None:
@@ -45,7 +44,6 @@ def shm_create_from_tensor(tensor: torch.Tensor) -> tuple[_shm.SharedMemory, _sh
 
     shm = _shm.SharedMemory(create=True, size=size)
     keeper = _shm.SharedMemory(name=shm.name)
-    logger.warning("shm_create: name=%s size=%d", shm.name, size)
 
     shm_view = np.ndarray(t_np.shape, dtype=t_np.dtype, buffer=shm.buf)
     shm_view[:] = t_np[:]
@@ -107,14 +105,12 @@ class ShmGetOperation(ShmOperation):
 
         shm_name = self._transfer_info["shm_name"]
         size = self._transfer_info["size"]
-        logger.warning("ShmGetOperation: opening %s size=%d", shm_name, size)
 
         try:
             # 1. Open SHM
             try:
                 existing_shm = _shm.SharedMemory(name=shm_name)
             except FileNotFoundError:
-                logger.warning("ShmGetOperation: %s NOT FOUND (pending_puts=%d)", shm_name, len(_PENDING_PUTS))
                 raise RuntimeError(f"SHM block {shm_name} not found.")
 
             try:

@@ -371,9 +371,36 @@ EXTEND 路径在 `_attach_multimodal_replacements` 末尾也会显式设置（�
 
 ---
 
-## Milestone E：CUDA Graph / async decode 🔜 待开发
+## Milestone E：CUDA Graph / async decode ✅ 已完成
 
-（见 `开发文档_phase2.5_milestones.md` Step 4-5）
+### CUDA Graph
+
+**改动**：`stages.py` 中 `disable_cuda_graph` 从 `True` 改为 `False`。
+
+**问题**：ngram embedding 将 LM head 输出从 `131125` 扩展到实际维度（如 `282624`），但 `LogitsProcessor.vocab_size` 和 CUDA graph buffer 维度不一致，capture 时 crash。
+
+**修复**：模型加载后从 `lm_head.weight` 算出真实 vocab_size，同步更新 `model_config.vocab_size` 和 `logits_processor.vocab_size`（见 Debug-006）。
+
+### Overlap schedule
+
+**改动**：`stages.py` 中 `disable_overlap_schedule` 从 `True` 改为 `False`。
+
+**安全适配**：`model_runner.py` `before_prefill` 中 decode 分支显式清空 `longcat_replace_embeds/positions`，防止 overlap 模式下 ForwardBatch 池化导致 prefill 残留泄漏到 decode。
+
+### Async decode
+
+**改动**：`stages.py` 中 `OmniScheduler()` 构造增加 `enable_async_decode=True`。batch_size=1 时自动退回同步路径。
+
+### 全开结果
+
+CG + overlap + async_decode 同时开启：
+
+| 场景 | 并发数 | decode 吞吐 | CUDA graph |
+|------|--------|------------|------------|
+| 单请求 | 1 | ~212 tokens/s | True |
+| 双请求并发 | 2 | ~539 tokens/s | True |
+
+tokens/s 从最初的 0.5 提升了三个数量级。
 
 ---
 

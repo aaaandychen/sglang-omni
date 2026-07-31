@@ -196,7 +196,7 @@ def create_longcat_next_text_executor(
     max_new_tokens: int = 4096,
     context_length: int = 131072,
     mem_fraction_static: float | None = None,
-    enable_torch_compile: bool = False,
+    enable_torch_compile: bool = True,
     tp_size: int = 1,
     tp_rank: int = 0,
     server_args_overrides: dict[str, Any] | None = None,
@@ -307,6 +307,7 @@ def create_longcat_next_text_executor(
         model_runner=LongcatNextModelRunner(model_worker, output_proc),
         request_builder=request_builder,
         result_adapter=result_adapter,
+        enable_async_decode=True,
     )
 
 
