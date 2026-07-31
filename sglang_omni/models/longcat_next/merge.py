@@ -56,6 +56,14 @@ def _merge_for_text_ar(payloads: dict[str, StagePayload]) -> StagePayload:
     # image.encoder_outs[IMAGE_STAGE] — the outer key matches the inner key.
     image_out = image.encoder_outs.get(IMAGE_STAGE, {})
     audio_out = audio.encoder_outs.get(AUDIO_STAGE, {})
+    _dbg_ve = image_out.get("visual_embeds")
+    _logger = __import__("logging").getLogger(__name__)
+    _logger.warning(
+        "merge_for_text_ar image_out.visual_embeds type=%s is_tensor_ref=%s numel=%s",
+        type(_dbg_ve).__name__,
+        is_tensor_ref_dict(_dbg_ve),
+        tensor_ref_numel(_dbg_ve) if is_tensor_ref_dict(_dbg_ve) else getattr(_dbg_ve, "numel", lambda: "N/A")(),
+    )
 
     image_positions = pre.mm_inputs.get("image_positions")
     audio_positions = pre.mm_inputs.get("audio_positions")
@@ -87,10 +95,6 @@ def _merge_for_text_ar(payloads: dict[str, StagePayload]) -> StagePayload:
     merged = LongcatNextPipelineState(
         prompt=pre.prompt,
         mm_inputs=pre.mm_inputs,
-        encoder_outs={
-            **({IMAGE_STAGE: image_out} if image_out else {}),
-            **({AUDIO_STAGE: audio_out} if audio_out else {}),
-        },
         text_ar_inputs=text_ar_inputs,
     )
     return payload_with_state(pre_payload, merged)

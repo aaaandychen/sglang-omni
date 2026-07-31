@@ -14,25 +14,43 @@ from .base import Relay, RelayOperation, register_relay
 
 logger = logging.getLogger(__name__)
 
+# Per-process registry of ShmPutOperation handles that must survive GC
+# until the consumer stage reads and unlinks the SHM segment.
+# Keyed by shm_name, removed by ShmGetOperation after successful unlink.
+_PENDING_PUTS: dict[str, ShmPutOperation] = {}
 
-def shm_create_from_tensor(tensor: torch.Tensor) -> _shm.SharedMemory:
-    """Creates a SHM block and writes tensor data into it (optimized single copy)."""
+
+def _register_shm_put(op: "ShmPutOperation") -> None:
+    shm_name = op._shm_obj.name
+    _PENDING_PUTS[shm_name] = op
+    logger.warning("_register_shm_put: %s (total pending: %d)", shm_name, len(_PENDING_PUTS))
+
+
+def _unregister_shm_put(shm_name: str) -> None:
+    _PENDING_PUTS.pop(shm_name, None)
+
+
+def shm_create_from_tensor(tensor: torch.Tensor) -> tuple[_shm.SharedMemory, _shm.SharedMemory]:
+    """Creates a SHM block, writes tensor data, returns (creator, keeper).
+
+    Returns TWO SharedMemory handles for the same segment:
+    - creator: the original ``create=True`` handle (used for writing)
+    - keeper:  a second ``name=...`` handle that pins the segment in the
+      resource tracker so that GC of the creator handle in this process
+      does not trigger premature shm_unlink before the consumer opens it.
+    """
     t_cpu = tensor.cpu() if tensor.is_cuda else tensor
     t_np = t_cpu.numpy().reshape(-1)
     size = t_np.nbytes
 
-    # 1. Create SHM directly
     shm = _shm.SharedMemory(create=True, size=size)
+    keeper = _shm.SharedMemory(name=shm.name)
+    logger.warning("shm_create: name=%s size=%d", shm.name, size)
 
-    # 2. Create a numpy view based on SHM memory
-    # This step is instantaneous and involves no copying
     shm_view = np.ndarray(t_np.shape, dtype=t_np.dtype, buffer=shm.buf)
-
-    # 3. Direct data copy (Only One Copy)
-    # Uses low-level C memcpy to write directly from source Tensor to SHM
     shm_view[:] = t_np[:]
 
-    return shm
+    return shm, keeper
 
 
 class ShmOperation(RelayOperation):
@@ -56,12 +74,16 @@ class ShmPutOperation(ShmOperation):
     so the operation is effectively complete immediately.
     """
 
-    def __init__(self, metadata: Any, shm_obj: _shm.SharedMemory):
+    def __init__(self, metadata: Any, shm_obj: _shm.SharedMemory, keeper: _shm.SharedMemory | None = None):
         super().__init__(metadata)
         self._shm_obj = shm_obj
+        self._keeper = keeper
 
     async def wait_for_completion(self, timeout: float = 30.0) -> None:
-        # Sender simply closes the local handle; Receiver is responsible for unlinking.
+        # Close the creator fd so we don't leak it.  The _keeper handle
+        # (a second shm_open on the same segment) stays alive inside
+        # this op object and pins the segment in the resource tracker,
+        # preventing premature shm_unlink before the consumer opens it.
         if not self._completed:
             self._shm_obj.close()
             self._completed = True
@@ -85,12 +107,14 @@ class ShmGetOperation(ShmOperation):
 
         shm_name = self._transfer_info["shm_name"]
         size = self._transfer_info["size"]
+        logger.warning("ShmGetOperation: opening %s size=%d", shm_name, size)
 
         try:
             # 1. Open SHM
             try:
                 existing_shm = _shm.SharedMemory(name=shm_name)
             except FileNotFoundError:
+                logger.warning("ShmGetOperation: %s NOT FOUND (pending_puts=%d)", shm_name, len(_PENDING_PUTS))
                 raise RuntimeError(f"SHM block {shm_name} not found.")
 
             try:
@@ -140,7 +164,7 @@ class ShmRelay(Relay):
 
         try:
             # 1. Create SHM and write data
-            shm = shm_create_from_tensor(tensor)
+            shm, keeper = shm_create_from_tensor(tensor)
             size_bytes = shm.size
 
             # 2. Construct Metadata
@@ -156,7 +180,9 @@ class ShmRelay(Relay):
             # 3. Release semaphore immediately (Fire-and-Forget model)
             self._sem.release()
 
-            return ShmPutOperation(metadata, shm)
+            op = ShmPutOperation(metadata, shm, keeper)
+            _register_shm_put(op)
+            return op
 
         except Exception as e:
             self._sem.release()

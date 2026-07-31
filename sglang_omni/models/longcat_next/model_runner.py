@@ -29,6 +29,8 @@ class LongcatNextModelRunner(ModelRunner):
     def before_prefill(self, forward_batch: Any, schedule_batch: Any, requests: list) -> None:
         del requests
         if not schedule_batch.forward_mode.is_extend():
+            forward_batch.longcat_replace_embeds = None
+            forward_batch.longcat_replace_positions = None
             return
 
         with longcat_timing(

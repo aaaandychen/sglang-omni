@@ -710,10 +710,19 @@ class Stage:
             self._tp_fanout.fanout_work(payload)
         payload_for_scheduler = payload
         if tensor_refs_enabled():
-            payload_for_scheduler = await relay_io.materialize_payload_tensor_refs(
-                self.relay, payload, current_stage=self.name
+            _materialize_logger = logging.getLogger(__name__)
+            _materialize_logger.warning(
+                "_execute: stage=%s role=%s tensor_refs_enabled=True",
+                self.name, self.role,
             )
-            self._remember_payload_tensor_refs(request_id, payload_for_scheduler)
+            # TensorRef SHM blobs are single-resolve (read+unlink).
+            # Only the leader materializes; follower ranks receive
+            # the resolved payload through the scheduler's TP broadcast.
+            if self.role == "leader":
+                payload_for_scheduler = await relay_io.materialize_payload_tensor_refs(
+                    self.relay, payload, current_stage=self.name
+                )
+                self._remember_payload_tensor_refs(request_id, payload_for_scheduler)
         self.scheduler.inbox.put(
             IncomingMessage(
                 request_id=request_id, type="new_request", data=payload_for_scheduler
