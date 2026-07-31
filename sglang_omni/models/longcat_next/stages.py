@@ -278,6 +278,10 @@ def create_longcat_next_text_executor(
     model_config.vocab_size = _actual_vocab
     _model.logits_processor.vocab_size = _actual_vocab
 
+    # ── Phase 3: audio head ───────────────────────────────────────────
+    with longcat_timing("text_ar_audio_head_init", tp_rank=tp_rank, gpu_id=gpu_id):
+        _attach_audio_head(model_path, _model, gpu_id=gpu_id, dtype=dtype)
+
     if want_cuda_graph:
         with longcat_timing("text_ar_cuda_graph_init", tp_rank=tp_rank, gpu_id=gpu_id):
             model_worker.model_runner.init_device_graphs()
@@ -309,6 +313,60 @@ def create_longcat_next_text_executor(
         result_adapter=result_adapter,
         enable_async_decode=True,
     )
+
+
+def _attach_audio_head(
+    model_path: str,
+    model: Any,
+    *,
+    gpu_id: int = 0,
+    dtype: str = "bfloat16",
+) -> None:
+    """Create and attach a LongcatNextAudioHead to the AR model (Phase 3)."""
+    from transformers import AutoConfig
+
+    from sglang_omni.models.longcat_next.components.audio_head import (
+        LongcatNextAudioHead,
+    )
+
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    audio_cfg = config.audio_config
+    vq_cfg = audio_cfg.get("vq_config", {}) if isinstance(audio_cfg, dict) else getattr(audio_cfg, "vq_config", {})
+    codebook_sizes = (
+        list(vq_cfg.get("codebook_sizes", []))
+        if isinstance(vq_cfg, dict)
+        else list(getattr(vq_cfg, "codebook_sizes", []))
+    )
+    if not codebook_sizes:
+        raise ValueError(
+            "LongCat-Next config.audio_config.vq_config.codebook_sizes "
+            "is required for Phase 3 audio head."
+        )
+
+    audio_head = LongcatNextAudioHead(
+        model_path,
+        hidden_size=int(config.hidden_size),
+        codebook_sizes=codebook_sizes,
+        transformer_ffn_scale=(
+            audio_cfg.get("audio_head_transformer_ffn_scale", 0)
+            if isinstance(audio_cfg, dict)
+            else getattr(audio_cfg, "audio_head_transformer_ffn_scale", 0)
+        ),
+        transformer_dims=(
+            audio_cfg.get("audio_head_transformer_dims", 0)
+            if isinstance(audio_cfg, dict)
+            else getattr(audio_cfg, "audio_head_transformer_dims", 0)
+        ),
+        transformer_layers=(
+            audio_cfg.get("audio_head_transformer_layers", 0)
+            if isinstance(audio_cfg, dict)
+            else getattr(audio_cfg, "audio_head_transformer_layers", 0)
+        ),
+        audio_offset=int(config.audio_offset),
+        device=f"cuda:{gpu_id}",
+        dtype=dtype,
+    )
+    model.set_audio_head(audio_head)
 
 
 def create_longcat_next_executor(*args: Any, **kwargs: Any):

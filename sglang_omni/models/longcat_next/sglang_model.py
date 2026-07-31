@@ -125,7 +125,11 @@ _MULTIMODAL_SKIP_PREFIXES: tuple[str, ...] = (
 
 
 class LongcatNextTextForCausalLM(LongcatFlashForCausalLM):
-    """LongCat-Next AR backbone for sglang-omni (text-only, Phase 1)."""
+    """LongCat-Next AR backbone for sglang-omni (text-only Phase 1, audio Phase 3).
+
+    Phase 3 attaches a :class:`LongcatNextAudioHead` via :meth:`set_audio_head`
+    after weight initialisation for dual-head (text + audio codebook) decode.
+    """
 
     # With config.vocab_size = full_vocab (131 125), both embed_tokens
     # and lm_head have the same shape.  The parent's default weight tying
@@ -255,6 +259,15 @@ class LongcatNextTextForCausalLM(LongcatFlashForCausalLM):
                     "LongCat-Next: recomputed oe_weights with hash_base=%d",
                     text_vocab,
                 )
+
+        # Phase 3 audio head — attached post-init by stages.py via set_audio_head().
+        self.audio_head: nn.Module | None = None
+
+    # ── Phase 3 audio head setter ────────────────────────────────────────
+
+    def set_audio_head(self, audio_head: nn.Module) -> None:
+        """Attach a :class:`LongcatNextAudioHead` for dual-head decode."""
+        self.audio_head = audio_head
 
     # ── multimodal prefill forward ─────────────────────────────────────
 
