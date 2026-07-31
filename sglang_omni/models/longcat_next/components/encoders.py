@@ -62,10 +62,10 @@ class _OffsetCodebookEmbedding(nn.Module):
     @torch.no_grad()
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         ids = ids.long()
-        out = None
+        out: torch.Tensor | None = None
         for i, layer in enumerate(self.layers):
             part = layer(ids[..., i].to(layer.weight.device))
-        out = part if out is None else out + part.to(out.device)
+            out = part if out is None else out + part.to(out.device)
         assert out is not None
         return out
 
