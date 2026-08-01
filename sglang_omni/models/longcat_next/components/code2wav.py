@@ -62,6 +62,7 @@ class LongcatNextCode2Wav(nn.Module):
     ) -> None:
         super().__init__()
         torch_dtype = resolve_dtype(dtype) or torch.bfloat16
+        self._dtype = torch_dtype
         self.model_path = model_path
 
         # ── audio de-tokenizer (flow matching) ──────────────────────────
@@ -143,26 +144,27 @@ class LongcatNextCode2Wav(nn.Module):
             for j, i in enumerate(valid_mask.nonzero(as_tuple=True)[0])
         ]
         flatten_codes = torch.cat(valid_codes_list, dim=0).unsqueeze(0)
-        ret = self.audio_tokenizer.decode(
-            flatten_codes.view(-1, audio_codes.shape[-1]),
-            bridge_length=valid_len,
-        )
-
-        # Reconstruct per-sample waveforms.
-        results: list[torch.Tensor | None] = []
-        valid_idx = 0
-        for i in range(audio_codes.shape[0]):
-            if not valid_mask[i]:
-                results.append(None)
-                continue
-            mel = ret.flow_matching_mel[valid_idx][
-                : int(ret.flow_matching_mel_lengths[valid_idx]), :
-            ]
-            wav = self.vocoder.decode(
-                mel.transpose(0, 1).to(torch.float32).unsqueeze(0),
+        with torch.amp.autocast("cuda", dtype=self._dtype):
+            ret = self.audio_tokenizer.decode(
+                flatten_codes.view(-1, audio_codes.shape[-1]),
+                bridge_length=valid_len,
             )
-            results.append(wav.cpu())
-            valid_idx += 1
+
+            # Reconstruct per-sample waveforms.
+            results: list[torch.Tensor | None] = []
+            valid_idx = 0
+            for i in range(audio_codes.shape[0]):
+                if not valid_mask[i]:
+                    results.append(None)
+                    continue
+                mel = ret.flow_matching_mel[valid_idx][
+                    : int(ret.flow_matching_mel_lengths[valid_idx]), :
+                ]
+                wav = self.vocoder.decode(
+                    mel.transpose(0, 1).unsqueeze(0),
+                )
+                results.append(wav.cpu())
+                valid_idx += 1
 
         return results
 

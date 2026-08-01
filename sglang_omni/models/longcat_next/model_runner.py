@@ -197,9 +197,6 @@ class LongcatNextModelRunner(ModelRunner):
         State transitions (text ↔ audio mode) are driven by text token
         detection and run regardless of whether audio codes were produced.
         """
-        output_ids = getattr(schedule_batch, "output_ids", None)
-        if output_ids is None:
-            return
         reqs = getattr(schedule_batch, "reqs", [])
         if not reqs:
             return
@@ -213,7 +210,11 @@ class LongcatNextModelRunner(ModelRunner):
         )
 
         for i, req in enumerate(reqs):
-            text_token = int(output_ids[i])
+            # output_ids is a per-request list; latest token is the last element.
+            _req_output_ids = getattr(req, "output_ids", None) or []
+            if not _req_output_ids:
+                continue
+            text_token = int(_req_output_ids[-1])
             codes_i = (
                 new_audio_codes[i].cpu()
                 if new_audio_codes is not None
@@ -266,4 +267,6 @@ class LongcatNextModelRunner(ModelRunner):
                 stacked = torch.stack(codes)  # [N_steps, 8]
                 rid = sched_req.request_id
                 if rid in outputs:
+                    if outputs[rid].extra is None:
+                        outputs[rid].extra = {}
                     outputs[rid].extra["audio_codes"] = stacked

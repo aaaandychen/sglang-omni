@@ -407,22 +407,48 @@ def create_code2wav_executor(
     def _decode(payload):
         import torch
 
+        from sglang_omni.proto import StagePayload
+
         with longcat_timing("code2wav_request", request_id=payload.request_id):
             state = payload.data if isinstance(payload.data, dict) else {}
             audio_codes = state.get("audio_codes")
 
-            result = dict(state)  # pass-through text, usage, etc.
+            result: dict[str, Any] = {
+                "text": state.get("text", ""),
+                "modality": state.get("modality", "text"),
+                "usage": state.get("usage", {}),
+            }
             if audio_codes is None:
                 result["audio_waveforms"] = []
-                return result
+                return StagePayload(
+                    request_id=payload.request_id,
+                    request=payload.request,
+                    data=result,
+                )
             if isinstance(audio_codes, list):
                 audio_codes = (
                     torch.stack(audio_codes) if audio_codes
                     else torch.empty((0, 8), dtype=torch.long)
                 )
+            # code2wav.decode expects [batch, steps, codebooks] on the correct device.
+            if audio_codes.dim() == 2:
+                audio_codes = audio_codes.unsqueeze(0)
+            audio_codes = audio_codes.to(device=device)
             waveforms = code2wav.decode(audio_codes)
-            result["audio_waveforms"] = waveforms
-            return result
+            # Client expects audio_waveform (singular) as bytes + dtype + shape.
+            wav = waveforms[0] if waveforms else None
+            if wav is not None and wav.numel() > 0:
+                arr = wav.detach().cpu().numpy()
+                result["audio_waveform"] = arr.tobytes()
+                result["audio_waveform_dtype"] = str(arr.dtype)
+                result["audio_waveform_shape"] = list(arr.shape)
+            else:
+                result.pop("audio_waveform", None)
+            return StagePayload(
+                request_id=payload.request_id,
+                request=payload.request,
+                data=result,
+            )
 
     return SimpleScheduler(_decode)
 

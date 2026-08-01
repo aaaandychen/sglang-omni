@@ -230,6 +230,16 @@ def make_longcat_next_text_adapters(
         if suppress_tokens:
             req._codec_suppress_tokens = list(suppress_tokens)
 
+        # Phase 3: initialize audio state for parallel (delay=0) speech output.
+        # LongCat-Next parallel mode generates text + audio codebook tokens
+        # simultaneously from the very first decode step.
+        # Phase 3: initialize audio state from params (more reliable than
+        # metadata which gets overwritten by pipeline relay).
+        output_modalities = params.get("output_modalities") or ["text"]
+        if "audio" in output_modalities:
+            req._longcat_audio_state = {"mode": "audio", "prev_codes": None}
+            req._longcat_audio_codes_list = []
+
         req_data = SGLangARRequestData(
             input_ids=torch.tensor(input_ids, dtype=torch.long),
             req=req,

@@ -428,3 +428,116 @@ sglang_omni/models/longcat_next/
 - **Serial**：先完整生成文本，再切换到 audio 模式生成全部音频 token。
 - **随机延迟训练**：训练时在文本结束到音频开始间插入随机延迟（`delay`），模型学会两种模式。推理时 `delay=0` 即为 parallel（流式语音）。
 - **统一 checkpoint**：同一个权重同时支持两种模式，不需要独立训练。
+
+---
+
+## 实施记录（2026-08-01）
+
+### 当前状态
+
+✅ 端到端语音输出已跑通。支持 `modalities: ["text", "audio"]` 请求，并行模式（delay=0）从第一个 decode step 同时产出文本和音频 codebook token，经 code2wav 解码为 PCM 波形返回客户端。
+
+⏳ 流式音频输出尚未实现——当前为 batch 模式，音频 codes 全部攒完后一次性送 code2wav 解码。
+
+### 遇到的问题与修复
+
+#### 问题 1：`_longcat_audio_state` 未初始化
+
+**现象**：`code2wav _decode: audio_codes=None` — 音频 token 从未生成。
+
+**根因**：`post_decode` 中 `_longcat_audio_state` 初始化为 `{"mode": "text"}`，模型始终在 text mode 跑，不会产出 audio token。LongCat-Next 的 parallel 模式（delay=0）要求从第一个 decode step 就同时产出文本+音频 token。
+
+**修复**：`request_builders.py` 中读取 `params["output_modalities"]`，若包含 `"audio"` 则初始化 `req._longcat_audio_state = {"mode": "audio", "prev_codes": None}` 和 `req._longcat_audio_codes_list = []`。
+
+#### 问题 2：`output_modalities` 未到达 text_ar
+
+**现象**：`output_modalities=['text']` 而非 `['text', 'audio']`。
+
+**根因**：API 将 `output_modalities` 放入 `OmniRequest.metadata`，但 `request_builders.py` 从 `payload.request.params` 读取——`params` 只含 sampling 参数，不含 `output_modalities`。
+
+**修复**：`client.py` `_build_omni_request` 中同时将 `output_modalities` 写入 `params["output_modalities"]`。
+
+#### 问题 3：`post_decode` 无法读取 output_ids
+
+**现象**：`output_ids=False` — `ScheduleBatch.output_ids` 为 None。
+
+**根因**：`output_ids` 是 SGLang `Req` 对象的属性（per-request），不在 `ScheduleBatch` 上。
+
+**修复**：`model_runner.py` 中从 `req.output_ids[-1]` 读取当前 step 的 token。
+
+#### 问题 4：`outputs[rid].extra` 为 None
+
+**现象**：`'NoneType' object does not support item assignment`。
+
+**根因**：`post_process_outputs` 中 `outputs[rid].extra["audio_codes"]` 赋值时 `extra` 可能为 None。
+
+**修复**：None guard，先初始化空 dict。
+
+#### 问题 5：code2wav tensor 维度不匹配
+
+**现象**：`too many indices for tensor of dimension 2`。
+
+**根因**：`audio_codes` 是 `[N, 8]`，`code2wav.decode()` 期望 `[batch, N, 8]`。
+
+**修复**：`stages.py` 中 `unsqueeze(0)` 加 batch 维度。
+
+#### 问题 6：CPU/GPU device 不匹配
+
+**现象**：`Expected all tensors to be on the same device, but found at least two devices, cuda:6 and cpu!`。
+
+**根因**：`audio_codes` 在 CPU 上，`code2wav` 在 GPU 6。
+
+**修复**：`audio_codes.to(device=device)`。
+
+#### 问题 7：code2wav dtype 不匹配（float32 vs bfloat16）
+
+**现象**：`Input type (float) and bias type (c10::BFloat16) should be the same`。
+
+**根因**：code2wav 模型权重是 bfloat16，但 `audio_tokenizer.decode` 和 `vocoder.decode` 的输入为 float32。
+
+**修复**：`code2wav.decode` 整体包 `torch.amp.autocast("cuda", dtype=self._dtype)`，mel 输入也改为 `.to(self._dtype)` 而非 `.to(torch.float32)`。
+
+#### 问题 8：msgpack 无法序列化 Tensor
+
+**现象**：`TypeError: can not serialize 'Tensor' object` — code2wav 返回时 relay 序列化失败。
+
+**根因**：(a) waveform 是 GPU tensor，msgpack 无法序列化；(b) `result = dict(state)` 把原始 `audio_codes` tensor 也带进了返回 dict。
+
+**修复**：(a) waveform 转 `numpy → tobytes()`，附带 `dtype` + `shape`；(b) result 只取 `text/modality/usage` 三个安全字段。
+
+#### 问题 9：vocoder 输出缩进错误
+
+**现象**：`results.append(wav.cpu())` 在 for 循环外执行。
+
+**根因**：autocast 重构时缩进错位。
+
+**修复**：修正缩进。
+
+### 改动文件清单
+
+| 文件 | 改动 |
+|------|------|
+| `client/client.py` | `_build_omni_request` 将 `output_modalities` 写入 `params` |
+| `request_builders.py` | 读取 `params["output_modalities"]` 初始化 `_longcat_audio_state` |
+| `model_runner.py` | `post_decode` 从 `req.output_ids[-1]` 读 token；`extra` None guard |
+| `stages.py` | `_decode` 完整重写：dim fix、device fix、tensor→bytes 序列化 |
+| `code2wav.py` | autocast 包裹解码；mel dtype fix；缩进修复 |
+
+### 当前 API 用法
+
+```bash
+# Parallel 模式（delay=0）：文本+语音同时输出
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"/path/to/LongCat-Next","messages":[{"role":"user","content":"Say hello."}],"modalities":["text","audio"],"max_tokens":64}'
+
+# 流式版本
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"/path/to/LongCat-Next","messages":[{"role":"user","content":"Say hello."}],"modalities":["text","audio"],"max_tokens":64,"stream":true}'
+```
+
+### 待完成
+
+- **流式音频输出**：当前为 batch 模式，需启用 `text_ar` 的 `stream_to=["code2wav"]` 配置，每产出一个 audio frame 即推送到 code2wav，实现渐进式语音合成。
+- **统一 checkpoint**：同一个权重同时支持两种模式，不需要独立训练。

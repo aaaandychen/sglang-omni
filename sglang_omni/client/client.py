@@ -447,6 +447,8 @@ class Client:
             metadata.setdefault("model", request.model)
         if request.output_modalities:
             metadata["output_modalities"] = request.output_modalities
+            # Also store in params so it survives pipeline relay rewrites.
+            params["output_modalities"] = request.output_modalities
         return OmniRequest(inputs=inputs, params=params, metadata=metadata)
 
     @staticmethod
