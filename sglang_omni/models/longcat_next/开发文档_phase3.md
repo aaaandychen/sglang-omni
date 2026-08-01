@@ -539,5 +539,44 @@ curl -s http://localhost:8000/v1/chat/completions \
 
 ### 待完成
 
-- **流式音频输出**：当前为 batch 模式，需启用 `text_ar` 的 `stream_to=["code2wav"]` 配置，每产出一个 audio frame 即推送到 code2wav，实现渐进式语音合成。
+- **OmniScheduler 发射 audio stream item**：当前 `stream_to` 配置已就绪，但 OmniScheduler 的 `_emit_stream_output` 回调尚未接入——text_ar 每步 decode 产出的 audio codes 没有推送到 code2wav 的 stream inbox。需要实现 `_stream_output_builder` 回调，在 `post_decode` 后将每帧 audio codes 打包成 `StreamItem` 通过 outbox 发送。
+
+---
+
+## 流式音频输出设计
+
+### 架构
+
+```
+text_ar (GPU 2-5)                             code2wav (GPU 6)
+  │                                               │
+  │ decode step 1: text_tok + audio_codes[0]     │
+  │ ──── stream_to ──── StreamItem ────────────→ │ buffer.append(codes[0])
+  │                                               │ [frames < min_frames: skip]
+  │ decode step 2: text_tok + audio_codes[1]     │
+  │ ──── stream_to ──── StreamItem ────────────→ │ buffer.append(codes[1])
+  │                                               │ [frames >= min_frames: decode → stream waveform]
+  │ ...                                           │ ...
+  │ decode step N: text_tok + audio_codes[N]     │
+  │ ──── batch payload ────────────────────────→ │ final decode remaining → complete
+```
+
+### Config 改动
+
+```python
+# text_ar: 新增 stream_to
+stream_to=["code2wav"]  # 每帧 audio codes 实时推送
+
+# code2wav: 新增 can_accept_stream_before_payload
+can_accept_stream_before_payload=True  # 支持在收到完整 payload 前处理 stream items
+```
+
+### code2wav 流式 Scheduler
+
+`stages.py` 中 `create_code2wav_executor` 改用 `StreamingSimpleScheduler`：
+- `compute_fn`：处理单个 stream item（audio frame），增量解码
+- `batch_compute_fn`：处理最终 payload，解码剩余帧
+
+非流式请求照旧走 batch 路径，框架通过 `is_streaming_payload` 自动区分。
+
 - **统一 checkpoint**：同一个权重同时支持两种模式，不需要独立训练。

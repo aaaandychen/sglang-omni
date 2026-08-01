@@ -31,6 +31,7 @@ def _text_ar_stage(
     gpu: list[int] | None = None,
     terminal: bool = True,
     next: list[str] | None = None,
+    stream_to: list[str] | None = None,
 ) -> StageConfig:
     return StageConfig(
         name=name,
@@ -46,6 +47,7 @@ def _text_ar_stage(
         tp_size=4,
         terminal=terminal,
         **(dict(next=next) if next else {}),
+        **(dict(stream_to=stream_to) if stream_to else {}),
     )
 
 
@@ -151,6 +153,9 @@ class LongcatNextPipelineConfig(PipelineConfig):
                 next=(
                     ["code2wav"] if _audio_output_enabled() else None
                 ),
+                stream_to=(
+                    ["code2wav"] if _audio_output_enabled() else None
+                ),
             ),
         ]
         + (
@@ -162,6 +167,7 @@ class LongcatNextPipelineConfig(PipelineConfig):
                     factory_args={"device": "cuda", "dtype": "bfloat16"},
                     gpu=6,
                     terminal=True,
+                    can_accept_stream_before_payload=True,
                 ),
             ]
             if _audio_output_enabled()

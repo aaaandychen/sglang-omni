@@ -317,6 +317,27 @@ def create_longcat_next_text_executor(
             max_new_tokens=max_new_tokens,
         )
 
+    # ── Phase 3: streaming audio output builder ──────────────────────────
+    def _audio_stream_builder(
+        rid: str, sched_req_data: Any, req_output: Any
+    ) -> list:
+        """Emit one OutgoingMessage per decode step carrying the latest audio codes.
+
+        Returns an ``OutgoingMessage(type="stream")`` so that the stage runtime
+        routes it to the ``stream_to`` targets (code2wav).
+        """
+        sgl_req = getattr(sched_req_data, "req", None)
+        if sgl_req is None:
+            return []
+        codes = getattr(sgl_req, "_longcat_latest_audio_codes", None)
+        if codes is None:
+            return []
+        # Prevent duplicate emission: mark as emitted.
+        sgl_req._longcat_latest_audio_codes = None
+        from sglang_omni.scheduling.messages import OutgoingMessage
+
+        return [OutgoingMessage(request_id=rid, type="stream", data=codes.cpu())]
+
     return OmniScheduler(
         tp_worker=model_worker,
         tree_cache=tree_cache,
@@ -329,6 +350,7 @@ def create_longcat_next_text_executor(
         model_runner=LongcatNextModelRunner(model_worker, output_proc),
         request_builder=request_builder,
         result_adapter=result_adapter,
+        stream_output_builder=_audio_stream_builder,
         enable_async_decode=True,
     )
 
@@ -393,64 +415,129 @@ def create_code2wav_executor(
     device: str = "cuda",
     dtype: str | None = "bfloat16",
 ):
-    """Create a SimpleScheduler for the audio de-tokenizer + vocoder (Phase 3)."""
+    """Create a streaming scheduler that decodes audio incrementally every N frames."""
+    import collections
+    import asyncio
+
+    import torch
+
     from sglang_omni.models.longcat_next.components.code2wav import (
         LongcatNextCode2Wav,
     )
-    from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+    from sglang_omni.proto import StagePayload
+    from sglang_omni.scheduling.messages import OutgoingMessage
+    from sglang_omni.scheduling.streaming_simple_scheduler import (
+        StreamingSimpleScheduler,
+    )
 
     with longcat_timing("code2wav_executor_init", device=device, dtype=dtype):
         code2wav = LongcatNextCode2Wav(
             model_path, device=device, dtype=dtype,
         )
 
-    def _decode(payload):
-        import torch
+    # Per-request ring buffers: list of [8] code tensors.
+    _buffers: dict[str, list[torch.Tensor]] = collections.defaultdict(list)
+    _STREAM_FRAMES = 20  # decode every 20 audio frames
 
-        from sglang_omni.proto import StagePayload
+    def _wav_to_result(wav: torch.Tensor | None) -> dict[str, Any]:
+        result: dict[str, Any] = {"text": "", "modality": "audio", "usage": {}}
+        if wav is not None and wav.numel() > 0:
+            arr = wav.detach().cpu().numpy()
+            result["audio_waveform"] = arr.tobytes()
+            result["audio_waveform_dtype"] = str(arr.dtype)
+            result["audio_waveform_shape"] = list(arr.shape)
+        return result
 
-        with longcat_timing("code2wav_request", request_id=payload.request_id):
+    def _decode_buffer(rid: str) -> torch.Tensor | None:
+        """Decode all buffered frames for *rid*, clear the buffer."""
+        frames = _buffers.pop(rid, [])
+        if not frames:
+            return None
+        codes = torch.stack(frames).unsqueeze(0).to(device=device)
+        wavs = code2wav.decode(codes)
+        return wavs[0] if wavs else None
+
+    def _decode_batch(payload: StagePayload) -> StagePayload:
+        """Batch decode — falls back to non-streaming path.
+
+        For streaming requests (identified by buffered frames), the audio
+        codes have already been decoded incrementally via ``on_stream_chunk``;
+        just flush remaining frames and skip re-decoding.
+        """
+        rid = payload.request_id
+        if rid in _buffers:
+            # Streaming request — flush remaining buffered frames.
+            remaining = _buffers.pop(rid, [])
+            wav = None
+            if remaining:
+                codes = torch.stack(remaining).unsqueeze(0).to(device=device)
+                wavs = code2wav.decode(codes)
+                wav = wavs[0] if wavs else None
+            r = _wav_to_result(wav)
+            return StagePayload(
+                request_id=rid, request=payload.request, data=r,
+            )
+
+        # Non-streaming path — identical to original.
+        with longcat_timing("code2wav_request", request_id=rid):
             state = payload.data if isinstance(payload.data, dict) else {}
             audio_codes = state.get("audio_codes")
-
             result: dict[str, Any] = {
                 "text": state.get("text", ""),
                 "modality": state.get("modality", "text"),
                 "usage": state.get("usage", {}),
             }
             if audio_codes is None:
-                result["audio_waveforms"] = []
                 return StagePayload(
-                    request_id=payload.request_id,
-                    request=payload.request,
-                    data=result,
+                    request_id=rid, request=payload.request, data=result,
                 )
             if isinstance(audio_codes, list):
                 audio_codes = (
                     torch.stack(audio_codes) if audio_codes
                     else torch.empty((0, 8), dtype=torch.long)
                 )
-            # code2wav.decode expects [batch, steps, codebooks] on the correct device.
             if audio_codes.dim() == 2:
                 audio_codes = audio_codes.unsqueeze(0)
             audio_codes = audio_codes.to(device=device)
             waveforms = code2wav.decode(audio_codes)
-            # Client expects audio_waveform (singular) as bytes + dtype + shape.
             wav = waveforms[0] if waveforms else None
             if wav is not None and wav.numel() > 0:
                 arr = wav.detach().cpu().numpy()
                 result["audio_waveform"] = arr.tobytes()
                 result["audio_waveform_dtype"] = str(arr.dtype)
                 result["audio_waveform_shape"] = list(arr.shape)
-            else:
-                result.pop("audio_waveform", None)
             return StagePayload(
-                request_id=payload.request_id,
-                request=payload.request,
-                data=result,
+                request_id=rid, request=payload.request, data=result,
             )
 
-    return SimpleScheduler(_decode)
+    class _StreamingCode2WavScheduler(StreamingSimpleScheduler):
+        def __init__(self):
+            super().__init__(
+                compute_fn=_decode_batch,
+                batch_compute_fn=None,
+                max_batch_size=1,
+                max_batch_wait_ms=0,
+            )
+
+        def on_stream_chunk(self, request_id: str, item) -> list[OutgoingMessage]:
+            """Handle each audio frame: buffer, decode every N frames."""
+            codes = item.data if not isinstance(item, (str, bytes)) else item
+            if not isinstance(codes, torch.Tensor):
+                return []
+            _buffers[request_id].append(codes.cpu() if codes.is_cuda else codes)
+            if len(_buffers[request_id]) < _STREAM_FRAMES:
+                return []
+
+            wav = _decode_buffer(request_id)
+            if wav is None:
+                return []
+            r = _wav_to_result(wav)
+            return [OutgoingMessage(request_id=request_id, type="stream", data=r)]
+
+        def is_streaming_payload(self, payload: StagePayload) -> bool:
+            return False  # Never use built-in streaming path; we handle it ourselves.
+
+    return _StreamingCode2WavScheduler()
 
 
 def create_longcat_next_executor(*args: Any, **kwargs: Any):

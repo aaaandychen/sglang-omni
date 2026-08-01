@@ -231,6 +231,8 @@ class LongcatNextModelRunner(ModelRunner):
                 # Still in audio mode — store codes for next step.
                 audio_state["prev_codes"] = codes_i
                 req._longcat_audio_codes_list.append(codes_i)
+                # Phase 3 streaming: mark latest codes for stream_output_builder.
+                req._longcat_latest_audio_codes = codes_i
                 if text_token == _AUDIOGEN_END_TOKEN_ID:
                     audio_state["mode"] = "text"
                     audio_state["prev_codes"] = None
