@@ -36,7 +36,26 @@ def _build_suppress_tokens(tokenizer: object) -> list[int]:
     )
     if full_vocab <= text_vocab:
         return []
-    return list(range(text_vocab, full_vocab))
+
+    # Phase 3: when audio output is enabled, allow audio control tokens
+    # (audiogen_start=131123, audiogen_end=131124, audiotext_pad=131122,
+    #  etc.) so the model can initiate speech generation.
+    # Without this, the model is forbidden from outputting the very tokens
+    # the state machine depends on.
+    from sglang_omni.models.longcat_next.components.code2wav import (
+        audio_output_enabled,
+    )
+
+    suppress = list(range(text_vocab, full_vocab))
+    if audio_output_enabled():
+        # Whitelist: tokens the model must be allowed to emit in audio mode.
+        _AUDIO_ALLOW = {
+            131122,  # audiotext_pad_token_id
+            131123,  # audiogen_start_token_id
+            131124,  # audiogen_end_token_id
+        }
+        suppress = [t for t in suppress if t not in _AUDIO_ALLOW]
+    return suppress
 
 
 def _extract_text(payload: StagePayload) -> str:
@@ -233,17 +252,30 @@ def make_longcat_next_text_adapters(
             origin_ids = getattr(sgl_req, "origin_input_ids", None)
             if origin_ids is not None:
                 prompt_tokens = len(origin_ids)
+
+        result_data: dict[str, Any] = {
+            "text": text,
+            "modality": "text",
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": len(output_ids),
+            },
+        }
+
+        # Phase 3: attach accumulated audio codes for code2wav decoding.
+        audio_codes_list = getattr(sgl_req, "_longcat_audio_codes_list", None)
+        if audio_codes_list:
+            result_data["audio_codes"] = (
+                torch.stack(audio_codes_list)
+                if len(audio_codes_list) > 1
+                else audio_codes_list[0].unsqueeze(0)
+            )
+            result_data["modality"] = "audio"
+
         return StagePayload(
             request_id=payload.request_id,
             request=payload.request,
-            data={
-                "text": text,
-                "modality": "text",
-                "usage": {
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": len(output_ids),
-                },
-            },
+            data=result_data,
         )
 
     return request_builder, result_adapter

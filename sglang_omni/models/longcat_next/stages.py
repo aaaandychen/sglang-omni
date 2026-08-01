@@ -3,10 +3,22 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import Any
 
 from sglang_omni.models.longcat_next.payload_types import longcat_log_timing, longcat_timing
 from sglang_omni.scheduling.stage_cache import StageOutputCache
+
+logger = logging.getLogger(__name__)
+
+# Env var to enable Phase 3 audio output (audio_head + code2wav).
+# Default off — the model acts as a text-only AR backbone until explicitly enabled.
+_ENV_ENABLE_AUDIO = "SGLANG_OMNI_LONGCAT_ENABLE_AUDIO_OUTPUT"
+
+
+def _audio_output_enabled() -> bool:
+    return os.getenv(_ENV_ENABLE_AUDIO, "").lower() in ("1", "true", "yes", "on")
 
 _ENCODER_CACHE_MAX_SIZE = 256
 _ENCODER_CACHE_MAX_BYTES = 1024 * 1024 * 1024  # 1 GiB
@@ -278,9 +290,15 @@ def create_longcat_next_text_executor(
     model_config.vocab_size = _actual_vocab
     _model.logits_processor.vocab_size = _actual_vocab
 
-    # ── Phase 3: audio head ───────────────────────────────────────────
-    with longcat_timing("text_ar_audio_head_init", tp_rank=tp_rank, gpu_id=gpu_id):
-        _attach_audio_head(model_path, _model, gpu_id=gpu_id, dtype=dtype)
+    # ── Phase 3: audio head (gated by env var) ────────────────────────
+    if _audio_output_enabled():
+        with longcat_timing("text_ar_audio_head_init", tp_rank=tp_rank, gpu_id=gpu_id):
+            _attach_audio_head(model_path, _model, gpu_id=gpu_id, dtype=dtype)
+    else:
+        logger.info(
+            "LongCat-Next audio output disabled (set %s=1 to enable)",
+            _ENV_ENABLE_AUDIO,
+        )
 
     if want_cuda_graph:
         with longcat_timing("text_ar_cuda_graph_init", tp_rank=tp_rank, gpu_id=gpu_id):
@@ -369,6 +387,46 @@ def _attach_audio_head(
     model.set_audio_head(audio_head)
 
 
+def create_code2wav_executor(
+    model_path: str,
+    *,
+    device: str = "cuda",
+    dtype: str | None = "bfloat16",
+):
+    """Create a SimpleScheduler for the audio de-tokenizer + vocoder (Phase 3)."""
+    from sglang_omni.models.longcat_next.components.code2wav import (
+        LongcatNextCode2Wav,
+    )
+    from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
+
+    with longcat_timing("code2wav_executor_init", device=device, dtype=dtype):
+        code2wav = LongcatNextCode2Wav(
+            model_path, device=device, dtype=dtype,
+        )
+
+    def _decode(payload):
+        import torch
+
+        with longcat_timing("code2wav_request", request_id=payload.request_id):
+            state = payload.data if isinstance(payload.data, dict) else {}
+            audio_codes = state.get("audio_codes")
+
+            result = dict(state)  # pass-through text, usage, etc.
+            if audio_codes is None:
+                result["audio_waveforms"] = []
+                return result
+            if isinstance(audio_codes, list):
+                audio_codes = (
+                    torch.stack(audio_codes) if audio_codes
+                    else torch.empty((0, 8), dtype=torch.long)
+                )
+            waveforms = code2wav.decode(audio_codes)
+            result["audio_waveforms"] = waveforms
+            return result
+
+    return SimpleScheduler(_decode)
+
+
 def create_longcat_next_executor(*args: Any, **kwargs: Any):
     """Alias kept for backward compatibility."""
     return create_longcat_next_text_executor(*args, **kwargs)
@@ -381,4 +439,5 @@ __all__ = [
     "create_audio_encoder_executor",
     "create_longcat_next_text_executor",
     "create_longcat_next_executor",
+    "create_code2wav_executor",
 ]

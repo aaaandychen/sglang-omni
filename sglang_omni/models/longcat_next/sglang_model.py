@@ -316,15 +316,34 @@ class LongcatNextTextForCausalLM(LongcatFlashForCausalLM):
         positions: torch.Tensor,
         forward_batch: "ForwardBatch",
     ) -> torch.Tensor:
+        # Phase 2: multimodal prefill — inject encoder outputs into input embeds.
         replace_embeds = getattr(forward_batch, "longcat_replace_embeds", None)
-        if replace_embeds is None:
-            return super().forward(input_ids, positions, forward_batch)
+        if replace_embeds is not None:
+            input_embeds = self._build_longcat_input_embeds(input_ids, forward_batch)
+            hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch
+            )
 
-        input_embeds = self._build_longcat_input_embeds(input_ids, forward_batch)
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
-        )
+        # Phase 3: audio decode — fuse previous-step audio codes into the
+        # input embedding, run LLM forward, then run audio_head as a side
+        # channel to produce new audio codes.
+        prev_audio_codes = getattr(forward_batch, "longcat_audio_codes", None)
+        if prev_audio_codes is not None and self.audio_head is not None:
+            text_emb = self.model.embed_tokens(input_ids, forward_batch)
+            audio_emb = self.audio_head.build_input_embedding(prev_audio_codes)
+            input_embeds = text_emb + audio_emb.to(text_emb.dtype)
+            hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+            # Side channel: expose audio codes for model_runner to consume.
+            forward_batch.longcat_new_audio_codes = self.audio_head(
+                hidden_states[:, -1],
+            )
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch
+            )
+
+        # Phase 1: standard text-only forward.
+        return super().forward(input_ids, positions, forward_batch)
 
     # ── load_weights ────────────────────────────────────────────────────
 

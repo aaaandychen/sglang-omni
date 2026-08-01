@@ -20,6 +20,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from sglang_omni.models.longcat_next.components.encoders import _OffsetCodebookEmbedding
 from sglang_omni.models.longcat_next.payload_types import longcat_timing
 from sglang_omni.models.weight_loader import load_module, load_weights_by_prefix, resolve_dtype
 
@@ -303,6 +304,19 @@ class LongcatNextAudioHead(nn.Module):
                 dtype=torch_dtype,
             )
 
+        # input_codebook_embedding sums ALL 8 codebook embeddings from
+        # embed_tokens.weight (like Phase 2 encoder _OffsetCodebookEmbedding).
+        # This provides the audio contribution fused into the LLM input
+        # embedding at the next decode step.
+        with longcat_timing("audio_head_input_emb_load"):
+            self.input_codebook_embedding = _OffsetCodebookEmbedding(
+                model_path=model_path,
+                offset=audio_offset,
+                codebook_sizes=codebook_sizes,
+                device=device,
+                dtype=torch_dtype,
+            )
+
         self.eval()
 
     @torch.no_grad()
@@ -336,6 +350,20 @@ class LongcatNextAudioHead(nn.Module):
             prev_audio_codes[:, codebook_id] = torch.argmax(logits, dim=-1)
 
         return prev_audio_codes
+
+    @torch.no_grad()
+    def build_input_embedding(
+        self, audio_codes: torch.Tensor
+    ) -> torch.Tensor:
+        """Sum 8 codebook embeddings for LLM input fusion.
+
+        Args:
+            audio_codes: ``[B, 8]`` codebook token ids (int64).
+
+        Returns:
+            ``[B, hidden_size]`` summed embedding, same dtype as the model.
+        """
+        return self.input_codebook_embedding(audio_codes)
 
 
 def _build_codebook_emb_layers(

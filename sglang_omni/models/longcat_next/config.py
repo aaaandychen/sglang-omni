@@ -8,6 +8,7 @@ aggregate stage before the AR backbone.
 
 from __future__ import annotations
 
+import os
 from typing import ClassVar
 
 from pydantic import Field
@@ -17,11 +18,19 @@ from sglang_omni.config import PipelineConfig, StageConfig
 _PKG = "sglang_omni.models.longcat_next"
 
 
+def _audio_output_enabled() -> bool:
+    """Return ``True`` when Phase 3 audio output is enabled."""
+    return os.getenv(
+        "SGLANG_OMNI_LONGCAT_ENABLE_AUDIO_OUTPUT", ""
+    ).lower() in ("1", "true", "yes", "on")
+
+
 def _text_ar_stage(
     *,
     name: str = "text",
     gpu: list[int] | None = None,
     terminal: bool = True,
+    next: list[str] | None = None,
 ) -> StageConfig:
     return StageConfig(
         name=name,
@@ -36,6 +45,7 @@ def _text_ar_stage(
         gpu=[0, 1, 2, 3] if gpu is None else gpu,
         tp_size=4,
         terminal=terminal,
+        **(dict(next=next) if next else {}),
     )
 
 
@@ -134,8 +144,29 @@ class LongcatNextPipelineConfig(PipelineConfig):
                 merge_fn=f"{_PKG}.merge.merge_for_text_ar",
                 next="text_ar",
             ),
-            _text_ar_stage(name="text_ar", gpu=[2, 3, 4, 5], terminal=True),
+            _text_ar_stage(
+                name="text_ar",
+                gpu=[2, 3, 4, 5],
+                terminal=not _audio_output_enabled(),
+                next=(
+                    ["code2wav"] if _audio_output_enabled() else None
+                ),
+            ),
         ]
+        + (
+            [
+                StageConfig(
+                    name="code2wav",
+                    process="code2wav",
+                    factory=f"{_PKG}.stages.create_code2wav_executor",
+                    factory_args={"device": "cuda", "dtype": "bfloat16"},
+                    gpu=6,
+                    terminal=True,
+                ),
+            ]
+            if _audio_output_enabled()
+            else []
+        )
     )
 
 
