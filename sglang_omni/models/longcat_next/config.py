@@ -108,6 +108,11 @@ class LongcatNextPipelineConfig(PipelineConfig):
                     ),
                 },
             ),
+            # Encoder stages micro-batch across requests by default
+            # (one merged ViT/audio forward per batch window).  Tune via
+            # factory_args or env: SGLANG_OMNI_LONGCAT_{IMAGE,AUDIO}_ENCODER_
+            # MAX_BATCH_SIZE / MAX_BATCH_WAIT_MS / MAX_BATCH_PATCHES|FRAMES;
+            # MAX_BATCH_SIZE=1 restores the legacy serial behavior.
             StageConfig(
                 name="image_encoder",
                 process="image_encoder",

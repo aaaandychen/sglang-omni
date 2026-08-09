@@ -24,6 +24,189 @@ _ENCODER_CACHE_MAX_SIZE = 256
 _ENCODER_CACHE_MAX_BYTES = 1024 * 1024 * 1024  # 1 GiB
 
 
+# ---------------------------------------------------------------------------
+# Encoder micro-batching helpers
+#
+# Both encoder stages run on a single GPU and used to process requests
+# strictly one at a time (SimpleScheduler defaults).  The scheduler already
+# supports cross-request micro-batching via ``batch_compute_fn``; the helpers
+# below implement the LongCat-specific pieces:
+#   * partition a batch into ready results (empty inputs / cache hit) and
+#     pending compute items;
+#   * merge pending items into ONE encoder forward (Qwen2-VL-style packed
+#     pixel_values + grid_thw for images, zero-padded feature stacking for
+#     audio) and split the outputs back per request;
+#   * fall back to per-request serial encoding if the merged forward fails.
+#
+# Expected per-request token counts come from the pad-token positions the
+# preprocessor already computed (image_positions / bridge_length), i.e. the
+# ground truth the AR injection path enforces downstream — no dependency on
+# tokenizer-internal merge factors.  A count mismatch aborts the merged path
+# and triggers the serial fallback, so batching never corrupts a request.
+# ---------------------------------------------------------------------------
+
+
+def _resolve_batch_param(value: int | None, env_name: str, default: int) -> int:
+    """Resolve a batching knob: explicit factory arg > env var > default."""
+    if value is not None:
+        return int(value)
+    raw = os.getenv(env_name, "")
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            logger.warning("invalid %s=%r, using default %s", env_name, raw, default)
+    return default
+
+
+class _PendingEncode:
+    """One batch item that needs a real encoder forward."""
+
+    __slots__ = ("index", "payload", "state", "inputs", "expected_tokens")
+
+    def __init__(self, index, payload, state, inputs, expected_tokens):
+        self.index = index
+        self.payload = payload
+        self.state = state
+        self.inputs = inputs
+        self.expected_tokens = expected_tokens
+
+
+def _partition_encoder_batch(payloads, *, stage: str, cache: "StageOutputCache"):
+    """Split a batch into (ready: dict[int, payload], pending: list[_PendingEncode]).
+
+    Items with no encoder inputs or with an encoder-cache hit are answered
+    immediately; everything else becomes a pending compute item carrying the
+    expected output token count used later for split validation.
+    """
+    from sglang_omni.models.longcat_next.payload_types import (
+        LongcatNextPipelineState,
+        payload_with_state,
+    )
+
+    ready: dict[int, object] = {}
+    pending: list[_PendingEncode] = []
+    for index, payload in enumerate(payloads):
+        state = LongcatNextPipelineState.from_dict(payload.data)
+        inputs = state.encoder_inputs.get(stage) or {}
+        if not inputs or not _has_encoder_media(stage, inputs):
+            state.encoder_outs[stage] = {}
+            ready[index] = payload_with_state(payload, state)
+            continue
+
+        cache_key = inputs.get("cache_key")
+        if cache_key:
+            cached = cache.get(cache_key)
+            if cached is not None:
+                longcat_log_timing(
+                    "encoder_cache",
+                    stage=stage,
+                    action="hit",
+                    cache_key=cache_key,
+                    request_id=payload.request_id,
+                )
+                state.encoder_outs[stage] = cached
+                ready[index] = payload_with_state(payload, state)
+                continue
+            longcat_log_timing(
+                "encoder_cache",
+                stage=stage,
+                action="miss",
+                cache_key=cache_key,
+                request_id=payload.request_id,
+            )
+
+        pending.append(
+            _PendingEncode(
+                index, payload, state, inputs, _expected_encoder_tokens(stage, inputs)
+            )
+        )
+    return ready, pending
+
+
+def _has_encoder_media(stage: str, inputs: dict) -> bool:
+    from sglang_omni.models.longcat_next.payload_types import IMAGE_STAGE
+
+    if stage == IMAGE_STAGE:
+        return inputs.get("pixel_values") is not None
+    return inputs.get("audio") is not None
+
+
+def _expected_encoder_tokens(stage: str, inputs: dict) -> int:
+    """Expected per-request output token count for split validation.
+
+    Image: number of image_pad placeholder positions.  Audio: sum of
+    bridge_length (falling back to audio pad positions).  Returns 0 when the
+    count cannot be determined, which disables the merged path.
+    """
+    from sglang_omni.models.longcat_next.payload_types import IMAGE_STAGE
+
+    if stage == IMAGE_STAGE:
+        positions = inputs.get("image_positions")
+        return int(positions.numel()) if positions is not None else 0
+    bridge_length = inputs.get("bridge_length")
+    if bridge_length is not None:
+        return int(bridge_length.sum().item())
+    positions = inputs.get("audio_positions")
+    return int(positions.numel()) if positions is not None else 0
+
+
+def _finalize_pending(
+    item: _PendingEncode, result, ready: dict, *, stage: str, cache
+) -> None:
+    """Attach an encoder result to its request state, cache it, mark ready."""
+    from sglang_omni.models.longcat_next.payload_types import payload_with_state
+
+    item.state.encoder_outs[stage] = result
+    cache_key = item.inputs.get("cache_key")
+    if cache_key:
+        cache.put(cache_key, result)
+        longcat_log_timing(
+            "encoder_cache",
+            stage=stage,
+            action="store",
+            cache_key=cache_key,
+            request_id=item.payload.request_id,
+        )
+    ready[item.index] = payload_with_state(item.payload, item.state)
+
+
+def _image_request_cost(payload) -> int:
+    """Batch cost = number of pixel patches (drives max_batch_cost)."""
+    from sglang_omni.models.longcat_next.payload_types import (
+        IMAGE_STAGE,
+        LongcatNextPipelineState,
+    )
+
+    try:
+        state = LongcatNextPipelineState.from_dict(payload.data)
+        inputs = state.encoder_inputs.get(IMAGE_STAGE) or {}
+        pixel_values = inputs.get("pixel_values")
+        return int(pixel_values.shape[0]) if pixel_values is not None else 0
+    except Exception:  # pragma: no cover - defensive; cost never blocks correctness
+        return 1
+
+
+def _audio_request_cost(payload) -> int:
+    """Batch cost = padded feature frames (batch_rows x frame_len)."""
+    from sglang_omni.models.longcat_next.payload_types import (
+        AUDIO_STAGE,
+        LongcatNextPipelineState,
+    )
+
+    try:
+        state = LongcatNextPipelineState.from_dict(payload.data)
+        inputs = state.encoder_inputs.get(AUDIO_STAGE) or {}
+        audio = inputs.get("audio")
+        if audio is None:
+            return 0
+        if audio.dim() == 2:
+            return int(audio.shape[0])
+        return int(audio.shape[0] * audio.shape[1])
+    except Exception:  # pragma: no cover - defensive
+        return 1
+
+
 def create_preprocessing_executor(model_path: str):
     from sglang_omni.models.longcat_next.components.preprocessor import (
         LongcatNextPreprocessor,
@@ -55,6 +238,9 @@ def create_image_encoder_executor(
     *,
     device: str = "cuda",
     dtype: str | None = "bfloat16",
+    max_batch_size: int | None = None,
+    max_batch_wait_ms: int | None = None,
+    max_batch_cost: int | None = None,
 ):
     from sglang_omni.models.longcat_next.components.encoders import (
         LongcatNextImageEncoder,
@@ -74,7 +260,18 @@ def create_image_encoder_executor(
         cache_device=None,
     )
 
-    def _encode(payload):
+    # Micro-batching knobs (factory arg > env > default).
+    batch_size = _resolve_batch_param(
+        max_batch_size, "SGLANG_OMNI_LONGCAT_IMAGE_ENCODER_MAX_BATCH_SIZE", 4
+    )
+    batch_wait_ms = _resolve_batch_param(
+        max_batch_wait_ms, "SGLANG_OMNI_LONGCAT_IMAGE_ENCODER_MAX_BATCH_WAIT_MS", 10
+    )
+    batch_cost = _resolve_batch_param(
+        max_batch_cost, "SGLANG_OMNI_LONGCAT_IMAGE_ENCODER_MAX_BATCH_PATCHES", 16384
+    )
+
+    def _encode_one(payload):
         with longcat_timing("image_encoder_request", request_id=payload.request_id):
             state = LongcatNextPipelineState.from_dict(payload.data)
             inputs = state.encoder_inputs.get(IMAGE_STAGE) or {}
@@ -121,7 +318,76 @@ def create_image_encoder_executor(
 
             return payload_with_state(payload, state)
 
-    return SimpleScheduler(_encode)
+    def _encode_pending_merged(pending: list[_PendingEncode], ready: dict) -> None:
+        """Run ONE ViT forward for all pending requests and split the output.
+
+        pixel_values is packed across images as [num_patches, patch_dim] with
+        per-image rows in visual_grid_thw, so concatenating both along dim 0
+        yields a valid merged input (same packing the tokenizer already uses
+        for multi-image requests).
+        """
+        import torch
+
+        counts = [item.expected_tokens for item in pending]
+        total_tokens = sum(counts)
+        with longcat_timing(
+            "image_encoder_batch",
+            batch_size=len(pending),
+            total_tokens=total_tokens,
+        ):
+            pixel_values = torch.cat(
+                [item.inputs["pixel_values"] for item in pending], dim=0
+            )
+            visual_grid_thw = torch.cat(
+                [item.inputs["visual_grid_thw"] for item in pending], dim=0
+            )
+            merged = model(
+                pixel_values=pixel_values, visual_grid_thw=visual_grid_thw
+            )
+        for key, tensor in merged.items():
+            if tensor.shape[0] != total_tokens:
+                raise RuntimeError(
+                    f"image encoder merged output '{key}' has {tensor.shape[0]} "
+                    f"tokens, expected {total_tokens} from image_positions"
+                )
+        offset = 0
+        for item, count in zip(pending, counts):
+            result = {key: tensor[offset : offset + count] for key, tensor in merged.items()}
+            offset += count
+            _finalize_pending(item, result, ready, stage=IMAGE_STAGE, cache=cache)
+
+    def _encode_batch(payloads):
+        ready, pending = _partition_encoder_batch(
+            payloads, stage=IMAGE_STAGE, cache=cache
+        )
+        mergeable = len(pending) > 1 and all(
+            item.expected_tokens > 0 for item in pending
+        )
+        if mergeable:
+            try:
+                _encode_pending_merged(pending, ready)
+            except Exception:
+                logger.exception(
+                    "image_encoder merged batch failed (%d requests); "
+                    "falling back to serial encoding",
+                    len(pending),
+                )
+                pending = [item for item in pending if item.index not in ready]
+                for item in pending:
+                    ready[item.index] = _encode_one(item.payload)
+        else:
+            for item in pending:
+                ready[item.index] = _encode_one(item.payload)
+        return [ready[index] for index in range(len(payloads))]
+
+    return SimpleScheduler(
+        _encode_one,
+        batch_compute_fn=_encode_batch,
+        max_batch_size=batch_size,
+        max_batch_wait_ms=batch_wait_ms,
+        request_cost_fn=_image_request_cost,
+        max_batch_cost=batch_cost if batch_cost > 0 else None,
+    )
 
 
 def create_audio_encoder_executor(
@@ -129,6 +395,9 @@ def create_audio_encoder_executor(
     *,
     device: str = "cuda",
     dtype: str | None = "bfloat16",
+    max_batch_size: int | None = None,
+    max_batch_wait_ms: int | None = None,
+    max_batch_cost: int | None = None,
 ):
     from sglang_omni.models.longcat_next.components.encoders import (
         LongcatNextAudioEncoder,
@@ -148,7 +417,18 @@ def create_audio_encoder_executor(
         cache_device=None,
     )
 
-    def _encode(payload):
+    # Micro-batching knobs (factory arg > env > default).
+    batch_size = _resolve_batch_param(
+        max_batch_size, "SGLANG_OMNI_LONGCAT_AUDIO_ENCODER_MAX_BATCH_SIZE", 8
+    )
+    batch_wait_ms = _resolve_batch_param(
+        max_batch_wait_ms, "SGLANG_OMNI_LONGCAT_AUDIO_ENCODER_MAX_BATCH_WAIT_MS", 10
+    )
+    batch_cost = _resolve_batch_param(
+        max_batch_cost, "SGLANG_OMNI_LONGCAT_AUDIO_ENCODER_MAX_BATCH_FRAMES", 0
+    )
+
+    def _encode_one(payload):
         with longcat_timing("audio_encoder_request", request_id=payload.request_id):
             state = LongcatNextPipelineState.from_dict(payload.data)
             inputs = state.encoder_inputs.get(AUDIO_STAGE) or {}
@@ -196,7 +476,92 @@ def create_audio_encoder_executor(
 
             return payload_with_state(payload, state)
 
-    return SimpleScheduler(_encode)
+    def _encode_pending_merged(pending: list[_PendingEncode], ready: dict) -> None:
+        """Run ONE audio-encoder forward for all pending requests and split.
+
+        Each request's audio features are [B_i, L_i, D] (already padded
+        within the request).  Cross-request batching zero-pads to the max
+        frame length and stacks along the batch dim; the encoder masks on
+        encoder_length, and the VQ bridger emits exactly sum(bridge_length)
+        tokens, so outputs are split by per-request bridge_length sums.
+        """
+        import torch
+
+        def _as_batched(audio):
+            return audio.unsqueeze(0) if audio.dim() == 2 else audio
+
+        counts = [item.expected_tokens for item in pending]
+        total_tokens = sum(counts)
+        with longcat_timing(
+            "audio_encoder_batch",
+            batch_size=len(pending),
+            total_tokens=total_tokens,
+        ):
+            audios = [_as_batched(item.inputs["audio"]) for item in pending]
+            max_len = max(int(audio.shape[1]) for audio in audios)
+            total_rows = sum(int(audio.shape[0]) for audio in audios)
+            merged_audio = audios[0].new_zeros(
+                (total_rows, max_len, int(audios[0].shape[2]))
+            )
+            row = 0
+            for audio in audios:
+                rows, frames = int(audio.shape[0]), int(audio.shape[1])
+                merged_audio[row : row + rows, :frames] = audio
+                row += rows
+            encoder_length = torch.cat(
+                [item.inputs["encoder_length"] for item in pending]
+            )
+            bridge_length = torch.cat([item.inputs["bridge_length"] for item in pending])
+            merged = model(
+                audio=merged_audio,
+                encoder_length=encoder_length,
+                bridge_length=bridge_length,
+            )
+        for key, tensor in merged.items():
+            if tensor.shape[0] != total_tokens:
+                raise RuntimeError(
+                    f"audio encoder merged output '{key}' has {tensor.shape[0]} "
+                    f"tokens, expected {total_tokens} from bridge_length"
+                )
+        offset = 0
+        for item, count in zip(pending, counts):
+            result = {key: tensor[offset : offset + count] for key, tensor in merged.items()}
+            offset += count
+            _finalize_pending(item, result, ready, stage=AUDIO_STAGE, cache=cache)
+
+    def _encode_batch(payloads):
+        ready, pending = _partition_encoder_batch(
+            payloads, stage=AUDIO_STAGE, cache=cache
+        )
+        mergeable = len(pending) > 1 and all(
+            item.expected_tokens > 0 and item.inputs.get("bridge_length") is not None
+            for item in pending
+        )
+        if mergeable:
+            try:
+                _encode_pending_merged(pending, ready)
+            except Exception:
+                logger.exception(
+                    "audio_encoder merged batch failed (%d requests); "
+                    "falling back to serial encoding",
+                    len(pending),
+                )
+                pending = [item for item in pending if item.index not in ready]
+                for item in pending:
+                    ready[item.index] = _encode_one(item.payload)
+        else:
+            for item in pending:
+                ready[item.index] = _encode_one(item.payload)
+        return [ready[index] for index in range(len(payloads))]
+
+    return SimpleScheduler(
+        _encode_one,
+        batch_compute_fn=_encode_batch,
+        max_batch_size=batch_size,
+        max_batch_wait_ms=batch_wait_ms,
+        request_cost_fn=_audio_request_cost,
+        max_batch_cost=batch_cost if batch_cost > 0 else None,
+    )
 
 
 def create_longcat_next_text_executor(
