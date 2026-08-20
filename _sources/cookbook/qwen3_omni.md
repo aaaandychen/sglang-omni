@@ -8,16 +8,16 @@ command for your hardware, then check the tables to confirm your combination is 
 ## Prerequisites
 
 ```bash
-docker pull frankleeeee/sglang-omni:dev
-docker run -it --shm-size 32g --gpus all frankleeeee/sglang-omni:dev /bin/zsh
+docker pull hongccc/sglang-omni:dev
+docker run -it --shm-size 32g --gpus all hongccc/sglang-omni:dev /bin/zsh
 ```
 
 ```bash
-git clone https://github.com/sgl-project/sglang-omni.git
-cd sglang-omni
 uv venv .venv -p 3.12 && source .venv/bin/activate
-uv pip install -v .
+uv pip install "sglang-omni==0.1.2"
 ```
+
+See [Installation](../get_started/installation.md) for Docker digests and source installs.
 
 ## Server Configuration
 
@@ -36,12 +36,16 @@ Colocated topology requires `--config examples/configs/qwen3_omni_colocated_h20.
 |---|---|---|---|---|
 | Thinker-only | — | — | BF16 | ✅ |
 | Thinker-only | — | — | FP8 | ✅ |
+| Thinker-only | — | — | AutoRound INT4 | ✅ |
 | Thinker-Talker | Disaggregated | TP=1 | BF16 | ✅ |
 | Thinker-Talker | Disaggregated | TP=1 | FP8 | ✅ |
+| Thinker-Talker | Disaggregated | TP=1 | AutoRound INT4 thinker + BF16 talker/code2wav | ✅ |
 | Thinker-Talker | Disaggregated | TP=2 | BF16 | ✅ |
 | Thinker-Talker | Disaggregated | TP=2 | FP8 | ✅ |
+| Thinker-Talker | Disaggregated | TP=2 | AutoRound INT4 thinker + BF16 talker/code2wav | ✅ |
 | Thinker-Talker | Colocated | TP=1 | BF16 | ✅ |
 | Thinker-Talker | Colocated | TP=1 | FP8 | ✅ |
+| Thinker-Talker | Colocated | TP=1 | AutoRound INT4 thinker + BF16 talker/code2wav | ✅ |
 
 ## Input / Output Modalities
 
