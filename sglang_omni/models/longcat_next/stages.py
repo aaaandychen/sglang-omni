@@ -968,6 +968,12 @@ def create_code2wav_executor(
         def is_streaming_payload(self, payload: StagePayload) -> bool:
             return False  # Never use built-in streaming path; we handle it ourselves.
 
+        def clear_stream_state(self, request_id: str) -> None:
+            # Called on both normal done and abort — drop per-request buffers so
+            # aborted/cancelled requests don't leak entries under long sessions.
+            _buffers.pop(request_id, None)
+            _stream_thresholds.pop(request_id, None)
+
     return _StreamingCode2WavScheduler()
 
 

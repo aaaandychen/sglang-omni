@@ -165,6 +165,11 @@ class RealtimeSession:
     async def handle_vad_emit(self, emit: Any) -> None:
         timestamp_ms = offsets_to_ms(self.buffer_origin_samples + emit.sample_offset)
         if emit.event_type == VADEvent.SPEECH_STARTED:
+            # Barge-in: user started speaking while we're still responding.
+            # Cancel the in-flight response (abort engine req + cancel task)
+            # so the new utterance takes over. Turn-based drain_queue picks up
+            # the next committed utterance afterwards.
+            await self._cancel_and_abort(self.active_task, self.active_request_id)
             # PCM16 mono: 2 bytes/sample.
             vad_byte = max(0, emit.sample_offset * 2)
             self.utterance_start_byte = min(vad_byte, self.audio_buffer.num_bytes)
@@ -232,19 +237,35 @@ class RealtimeSession:
     async def run_turn(self, item_id: str, audio_payload: str) -> None:
         """Pass 1: response (user-facing, streams fast).
         Pass 2: transcription (background, fills history).
+
+        Both text results are committed to ``conversation`` in a ``finally`` so
+        a barge-in cancel that lands between the two passes (response done,
+        transcription in flight) still persists the completed response instead
+        of dropping the whole turn's context.
         """
-        response_text = await self.run_response(audio_payload)
-        transcript = await self.run_transcription(item_id, audio_payload)
-        # Append in chronological order: user spoke first, assistant replied.
-        if transcript:
-            self.conversation.append(ConversationItem(role="user", text=transcript))
-        if response_text:
-            self.conversation.append(
-                ConversationItem(role="assistant", text=response_text)
-            )
+        response_text = ""
+        transcript = ""
+        try:
+            response_text = await self.run_response(audio_payload)
+            transcript = await self.run_transcription(item_id, audio_payload)
+        finally:
+            # Chronological order: user spoke first, assistant replied.
+            if transcript:
+                self.conversation.append(
+                    ConversationItem(role="user", text=transcript)
+                )
+            if response_text:
+                self.conversation.append(
+                    ConversationItem(role="assistant", text=response_text)
+                )
 
     async def run_response(self, audio_payload: str) -> str:
-        """Emit response.created → response.text.delta × N → text.done → done."""
+        """Emit response.created → text.delta / audio.delta × N → done.
+
+        Audio-out is gated on the session having "audio" in its modalities.
+        Audio chunks are streamed as ``response.audio.delta`` (base64 PCM16),
+        text chunks as ``response.text.delta`` — both may interleave.
+        """
         response_id = new_id("resp")
         request_id = f"rt-{self.session_id}-{uuid.uuid4().hex}"
         self.active_request_id = request_id
@@ -264,11 +285,13 @@ class RealtimeSession:
 
             resp_item_id = new_id("item")
             text_acc: list[str] = []
+            audio_emitted = False
             finish_reason = "stop"
             usage: dict[str, Any] | None = None
             async for chunk in self.client.completion_stream(
                 self.build_response_request(audio_payload),
                 request_id=request_id,
+                audio_format="pcm",
             ):
                 if chunk.modality == "text" and chunk.text:
                     text_acc.append(chunk.text)
@@ -282,6 +305,18 @@ class RealtimeSession:
                             delta=chunk.text,
                         )
                     )
+                elif chunk.modality == "audio" and chunk.audio_b64:
+                    audio_emitted = True
+                    await self.send(
+                        make_event(
+                            "response.audio.delta",
+                            response_id=response_id,
+                            item_id=resp_item_id,
+                            output_index=0,
+                            content_index=0,
+                            delta=chunk.audio_b64,
+                        )
+                    )
                 if chunk.finish_reason is not None:
                     finish_reason = chunk.finish_reason
                     usage = (
@@ -292,6 +327,16 @@ class RealtimeSession:
                     break
 
             response_text = "".join(text_acc)
+            if audio_emitted:
+                await self.send(
+                    make_event(
+                        "response.audio.done",
+                        response_id=response_id,
+                        item_id=resp_item_id,
+                        output_index=0,
+                        content_index=0,
+                    )
+                )
             await self.send(
                 make_event(
                     "response.text.done",
@@ -302,6 +347,9 @@ class RealtimeSession:
                     text=response_text,
                 )
             )
+            content = [{"type": "text", "text": response_text}]
+            if audio_emitted:
+                content.append({"type": "audio", "transcript": response_text})
             await self.send(
                 make_event(
                     "response.done",
@@ -316,7 +364,7 @@ class RealtimeSession:
                                 "object": "realtime.item",
                                 "type": "message",
                                 "role": "assistant",
-                                "content": [{"type": "text", "text": response_text}],
+                                "content": content,
                             }
                         ],
                         "usage": usage,
@@ -397,7 +445,7 @@ class RealtimeSession:
             messages=messages,
             sampling=self._sampling(),
             stream=True,
-            output_modalities=["text"],
+            output_modalities=list(self.session_object.modalities or ["text"]),
             metadata={"audios": [audio_payload]},
         )
 

@@ -240,37 +240,46 @@ P2 relay coalescing ❌ 不做（载荷 64B、消费端已 buffer、收益边际
 
 ### 3.1 目标
 
-同一对话用一个 request id 维护一致性；生成过程中用户语音可**打断 AR decode**，新输入 token 拼接到**同一 request** 做**增量 prefill**，实现"边听边说"。
+同一对话多轮交互保持上下文一致；生成过程中用户语音可**打断 AR decode**，之后续接新输入继续对话，实现"可打断的语音对话"。
+
+> 修正记录：早期目标写为"单 request id 常驻 + 同一 request 增量 prefill"。核对代码后确认多轮 KV 复用由 **RadixCache 前缀命中**免费提供，不需单 req 常驻。正确目标 = **每轮新 req + 前缀复用历史**。
 
 ### 3.2 与现有能力的关系
 
 | 层 | 现状 | 全双工需要 |
 |---|---|---|
-| **VAD 半双工**（`origin/main serve/realtime`）| turn-level VAD + barge-in（cancel 整个 response 重来）| barge-in 改为"保留 KV cache 的中断" |
-| **流式输出**（Phase 3）| token-level 增量解码，边 decode 边推 PCM | 复用，作为"说"的生产者 |
-| **chunked prefill**（Phase 2）| `_longcat_mm_consumed` 跨 chunk 消费 encoder 输出 | 延伸为"decode 中途插入增量 prefill" |
+| **VAD 回合制**（`serve/realtime`，已在当前分支）| VAD 串行回合，`speech_started` 只发事件不 cancel | 新建 barge-in：speech_started → `_cancel_and_abort` |
+| **流式输出**（Phase 3）| token-level 增量解码，边 decode 边推 PCM | 复用作为"说"的生产者；但 `run_response` 当前只收 text，需补 audio-out |
+| **多轮 KV 复用**（RadixCache）| `tree_cache` 前缀树已继承自 SGLang | 直接复用：每轮新 req 前缀命中即复用历史 KV |
 
-> 注意：VAD 半双工是"回合制对话调度"，流式输出是"回合内增量解码"，两者是编排层与生成层关系，全双工是要在 decode step 粒度真正并行"听"与"说"。
-
-### 3.3 请求生命周期（务实版：中断-续接）
+### 3.3 请求生命周期（降级方案：cancel + 新 req + 前缀复用）
 
 ```mermaid
 flowchart TB
-    S["conversation_id = request_id<br/>KV cache 常驻"] --> D["AR decode 产 text+audio"]
+    S["对话历史 KV 在 RadixCache"] --> D["AR decode 产 text+audio"]
     D --> L{"VAD 检测用户插话?"}
     L -->|否| D
-    L -->|是 barge-in| I["中断 decode<br/>保留 KV cache"]
-    I --> P["新语音 encode<br/>→ 增量 prefill 拼到序列尾部"]
+    L -->|是 barge-in| I["cancel 当前 req"]
+    I --> P["新语音开新 req（前缀命中复用历史 KV）"]
     P --> D
 ```
 
 ### 3.4 关键改造点
 
-1. **KV cache 生命周期（最大工程量）**
-   - 现状：`OmniScheduler` 走 SGLang 标准 "req 完成即回收 token_to_kv_pool"。
-   - 需要：单 request 在 decode ↔ prefill 之间反复横跳、KV 常驻。要改 scheduler 的 request 状态机，不只是 model_runner 层。
+1. **KV cache 生命周期（此前被高估为最大工程量，已修正）**
 
-2. **打断的插入点 vs 打断粒度（两个不同维度）**
+   > 修正记录：早期设计假设"全双工需要单 request 常驻 KV、并阻止 abort 释放 KV"。核对代码后确认这是**伪需求**，撤回。
+
+   - **abort 不会当场清 KV（双路径）**：`abort(request_id, defer_running_cleanup=True)` 对**正在 running** 的 req 只打 `to_finish = FINISH_ABORT()` 标记（`omni_scheduler.py:_mark_running_request_aborted`），**当步不碰 KV**；实际释放要等它下一步流到 `stream_output` 的 `req.finished()` 分支触发 `_abort_callback`。只有**不在 running**（waiting/pending）的 req 才走 `_release_immediate_request_resources` → `release_kv_cache` 立即释放。
+   - **多轮 KV 复用是 RadixCache 免费给的**：`tree_cache`（RadixCache）+ `enable_hierarchical_cache` 已继承自 SGLang。同一对话第二轮用**新 req**，前缀命中即复用历史 KV，只重算新增部分的 prefill。**根本不需要"单 req 常驻"**。
+   - **换出/暂存也已有原生机制**：`_retract_running_requests`（`retract_all` 放回 waiting queue）+ 优先级 preempt + `num_paused_reqs` 计数器，都是 SGLang 解决"显存不够留谁丢谁"的通用方案。
+   - **结论**：KV 生命周期是通用 stateful 服务问题，开源已解决，本仓库已继承。正确做法 = **每轮新 req + RadixCache 前缀复用**，不改 scheduler 状态机。
+
+2. **唯一的全双工真需求：mid-stream 序列内续接**
+   - RadixCache 解决的是**跨请求**（轮次之间）前缀复用；全双工独有的是**单请求内、decode 未结束时序列长度动态增长**（轮次之内边说边听），这是非标准能力。
+   - **MVP 降级方案**：用"cancel 当前 req + 开新 req + RadixCache 前缀命中复用历史"近似，代价是打断点后有一次 prefill 延迟，对 demo 完全够用。真正的序列内动态增长留作进阶里程碑。
+
+3. **打断的插入点 vs 打断粒度（两个不同维度）**
 
    **(a) 插入点 —— 打断逻辑加在哪里？**
    打断永远是 **step 之间的调度决策**，不可能中断正在 GPU 上执行的 forward（CUDA kernel 已 launch）。插入点就在 scheduler event loop 里，一个 batch step 跑完的后处理阶段：
@@ -294,35 +303,37 @@ flowchart TB
    **(c) async decode 的延迟量化（重要坑）**
    `enable_async_decode=True`（`stages.py:719`）走 one-step lookahead（`_event_loop_async_decode`），进入 `post_decode` 时**下一步已经 launch**。因此 hard barge-in 的**最小打断延迟 ≈ 1-2 个 decode step，而非 0**。MVP 阶段可先关掉 async decode 简化，或接受这 1-2 step 延迟。
 
-3. **RoPE / position 连续性**
-   - 增量 prefill 拼到序列尾部时，`position_ids` 要接续；`sglang_model._build_longcat_input_embeds` 的 `replace_positions` 注入需支持"decode 中途插入的新 encoder 输出"，而非仅初始 prefill。
+4. **RoPE / position 连续性（仅真 mid-stream 续接才需要）**
+   - 若走降级方案（cancel + 新 req + 前缀复用），**无此问题**（新 req 从 0 排 position，前缀命中只复用 KV）。
+   - 仅当做真正的序列内增长时，`position_ids` 才需接续、`replace_positions` 需支持 decode 中途注入。
 
-4. **两种全双工形态**
-   - **中断-续接（本文档推荐的第一步）**：sequential interleaving，改造量小，可基于现有 chunked prefill 增量演进。
+5. **两种全双工形态**
+   - **中断-续接（推荐第一步）**：sequential interleaving，MVP 用 cancel + 新 req + RadixCache 复用即可。
    - **论文 parallel generation（激进）**：同一 decode step 同时产 text+audio、同时消费输入音频（DiNA pure audio modality），改造量大。
 
-5. **复用 realtime 编排层**
-   - `origin/main serve/realtime/session.py` 已有 VAD + WebSocket + barge-in 信令，无需重造。
-   - 只需：把 `client.completion_stream` 换成长驻 full-duplex request 接口；把 VAD `speech_started` 从"cancel 整个 response"改为"向常驻 request 注入增量 prefill 中断信号"。
+6. **复用 realtime 编排层（现状校对修正）**
+   - `serve/realtime/` 已在**当前分支**（非仅 origin/main），VAD + WebSocket + 串行回合队列已就绪。
+   - **但两个现状需补齐**：(1) `run_response` 目前**只收 `chunk.modality=="text"`**（`session.py:273`），audio-out 未接；(2) VAD `speech_started` 目前**只发事件、不 cancel**（`session.py:167`），回合靠 `response_queue` 串行，barge-in 语义需**新建而非修改**（复用现成的 `_cancel_and_abort`）。
 
-### 3.5 落地路线
+### 3.5 落地路线（修正后）
 
 ```
-Step 1: 单 request 常驻 KV cache（改 scheduler request 状态机）
-Step 2: decode 中途可接受增量 prefill（复用 chunked prefill + _longcat_mm_consumed）
-Step 3: barge-in 从 "cancel 重来" 改为 "保留 KV 中断"（改 realtime session）
-Step 4: RoPE/position 连续性 + PCM truncate 对齐
-Step 5:（可选，激进）走论文 parallel generation 真并行
+A. audio-out 接线：run_response 消费 chunk.modality=="audio"，发 response.audio.delta   【低风险】
+B. VAD 触发 cancel 式 barge-in：speech_started → _cancel_and_abort 现有 active_task    【低风险】
+C.（降级全双工）每轮新 req + RadixCache 前缀复用历史 KV，无需改 scheduler       【中风险】
+D.（进阶，可选）真 mid-stream 序列内增量续接 / parallel generation                【高风险，待 GPU】
 ```
+
+> A+B 是纯编排层、离线可推演正确性、复用现成 abort，优先落地。C 靠 RadixCache（无需改状态机）。D 是唯一硬骨头，留作里程碑。
 
 ### 3.6 涉及文件
 
 | 文件 | 改动 |
 |---|---|
-| `scheduling/omni_scheduler.py` | request 状态机 / KV cache 常驻 |
-| `models/longcat_next/model_runner.py` | decode 中途增量 prefill 注入 |
-| `models/longcat_next/sglang_model.py` | position 连续性、中途 encoder 注入 |
-| `serve/realtime/session.py` | barge-in 改为保留 KV 中断、长驻 request 接口 |
+| `serve/realtime/session.py` | **A** audio-out 消费 + 发 audio.delta；**B** speech_started 触发 barge-in |
+| `serve/realtime/manager.py` | client 接入、supports_audio_output |
+| `scheduling/omni_scheduler.py` | （仅 D）序列内增量续接 |
+| `models/longcat_next/model_runner.py` | （仅 D）decode 中途增量 prefill 注入 |
 
 ---
 
@@ -332,59 +343,50 @@ Step 5:（可选，激进）走论文 parallel generation 真并行
 
 MVP **不追求真全双工**（同一 decode step 并行听+说，工程量大、风险高）。目标是用最小改动跑通一个可演示的闭环：**"可打断的半双工 + 单会话续接"**，验证核心假设。
 
-关键洞察：**大部分零件已存在，MVP 本质是"接线 + 一个保留 KV 的打断"**，而非从零造全双工。
+关键洞察：**大部分零件已存在（realtime 已在当前分支），MVP 本质是"补 audio-out + 接 VAD barge-in"**，而非从零造全双工。
 
 ```mermaid
 flowchart LR
-    subgraph 已有零件
-        A["realtime session<br/>VAD+WebSocket+barge-in信令<br/>(origin/main)"]
-        B["longcat-next 流式输出<br/>双头decode+code2wav<br/>(longcat-next分支)"]
+    subgraph exist["已有零件（均在当前分支）"]
+        A["realtime session<br/>VAD+WebSocket+串行回合"]
+        B["longcat-next 流式输出<br/>双头decode+code2wav"]
     end
-    A -. 未接线 .- B
-    subgraph MVP要做的
-        C["合并两分支"]
-        D["session 接 longcat<br/>completion_stream"]
-        E["barge-in 改为<br/>保留 KV 中断"]
+    A -. "run_response 只收 text，未接 audio" .- B
+    subgraph todo["MVP 要做"]
+        C["A: run_response 补 audio-out"]
+        D["B: speech_started 触发 barge-in"]
     end
 ```
 
 ### 4.2 分级实施
 
-#### Level 0 — 接线 Demo（最小，约 1-2 天）
+#### Level 0 (=A+B) — 可打断语音对话闭环（最小）
 
-**目标**：realtime WebSocket 前端能和 LongCat-Next 语音对话，支持 VAD 轮次 + "cancel 重来"式打断。
+**目标**：realtime WebSocket 前端能和 LongCat-Next 语音对话，VAD 轮次 + cancel 式打断。
 
-- 合并 `longcat-next` 分支与 `origin/main` 的 `serve/realtime/`
-- `RealtimeSessionManager` 传入 LongCat-Next client，`supports_audio_output=True`
-- `session.run_response` 的 `client.completion_stream` 直接消费 Phase 3 流式 PCM
+- **A**：`run_response` 增加消费 `chunk.modality=="audio"` 分支，发 `response.audio.delta`（现只收 text，`session.py:273`）
+- **B**：`handle_vad_emit` 的 `SPEECH_STARTED` → 若有未完成 `active_task` 则 `_cancel_and_abort`（复用现成方法 `session.py:434`）
 
-**几乎不改模型代码**，产出一个能语音对话、能被 VAD 打断（cancel 式）的 demo。演示已够用。
+**不改模型代码**，产出能语音对话、能被 VAD 打断（cancel 式）的 demo。多轮靠 RadixCache 前缀复用历史 KV。
 
-#### Level 1 — 保留 KV 的打断（核心增量，约 3-5 天）
+#### Level 1 (=C) — 多轮上下文一致（降级全双工）
 
-**目标**：打断时不 cancel 整个 request，而是保留 KV cache、续接新输入。落在 §3.4 已确认的 `post_decode` 插入点：
+**目标**：打断后续接时不重算历史。做法 = **每轮新 req + 前缀 conversation 一致（RadixCache 命中）**，无需改 scheduler。关键是保证同一会话的请求前缀（系统 prompt + 历史）**逐字一致**，让前缀树命中。
 
-1. **信号**：VAD `speech_started` → admin message 标记目标 req
-2. **step 边界响应**：`LongcatNextModelRunner.post_decode` 检测标记 → audio 状态机切回 text + 保留 KV（不 finished、不 release pool）
-3. **续接**：新语音 encode → 增量 prefill 拼到同一 req 序列尾（复用 `_longcat_mm_consumed` 的 chunked prefill 能力）
-4. **PCM truncate**：复用 `ConversationItemTruncate` 丢弃未播音频
+#### Level 2 (=D) — 真全双工（进阶，不放进 MVP）
 
-这是 MVP 的**技术含金量**所在——证明"单 id 续接 + 保留 KV 打断"可行。
-
-#### Level 2 — 接近全双工（进阶，2 周+，不放进 MVP）
-
-边听边说、interleaved prefill/decode（§3.4 第 4 点的 parallel generation）。留作后续里程碑。
+边听边说、序列内增量续接 / parallel generation。需 GPU 环境验证，留作后续里程碑。
 
 ### 4.3 MVP 风险与应对
 
 | 风险 | 说明 | MVP 应对 |
 |---|---|---|
-| **KV cache 生命周期** | SGLang 标准 req 完成即回收 pool，常驻要改 scheduler 状态机 | Level 1 只做"单会话单 req 常驻"，不做并发多会话，规避复杂度 |
-| **async decode 打断延迟** | 已 launch 下一步，最小打断延迟 ≈ 1-2 step（见 §3.4.2c） | Demo 可先关 async decode 简化，或接受 1-2 step 延迟 |
+| **多轮 KV 复用** | 靠 RadixCache 前缀命中，要求同会话请求前缀逐字一致 | 保证 system prompt + 历史拼接确定性，命中前缀树 |
+| **async decode 打断延迟** | 已 launch 下一步，最小打断延迟 ≈ 1-2 step（见 §3.4.3c） | Demo 可先关 async decode 简化，或接受 1-2 step 延迟 |
 
 ### 4.4 建议
 
-做 **Level 0 + Level 1** 作为 MVP：Level 0 保证有可跑可演示的兜底，Level 1 是核心价值点且恰好落在已理解的 `post_decode` 插入点上；Level 2 真并行风险高，MVP 阶段不碰。
+做 **Level 0 (A+B)** 作为 MVP 核心：纯编排层、复用现成 abort、离线可验证、零显存风险；Level 1 (C) 靠 RadixCache 自然得到多轮一致；Level 2 (D) 真并行需 GPU，MVP 不碰。
 
 ---
 
@@ -392,11 +394,10 @@ flowchart LR
 
 | 方向 | 工程量 | 风险 | 建议顺序 |
 |---|---|---|---|
-| 流式输出优化 P1（vocoder overlap） | 小 | 低（有参考） | **先做** |
-| Encoder cache CPU offload | 小 | 低 | 与 P1 并行 |
-| **MVP Level 0（接线 Demo）** | 小 | 低 | **可独立并行，快速出可演示成果** |
-| 流式输出优化 P2/P3 | 中 | 低 | 次之 |
-| **MVP Level 1（保留 KV 打断）** | 中 | 中 | 依赖 Level 0，MVP 核心价值 |
-| 全双工 Step 1-2（KV 常驻 + 增量 prefill） | 大 | 中 | 独立里程碑（Level 1 是其单会话子集） |
-| 全双工 Step 3-4（barge-in + 对齐） | 中 | 中 | 依赖 Step 1-2 |
-| 流式 P4/P5（CUDA Graph）、全双工 Step 5 / MVP Level 2 | 大 | 高 | 最后 |
+| Encoder cache CPU offload | 小 | 低 | ✅ 已实现 |
+| 流式输出优化 P3（渐进窗口）| 小 | 低 | ✅ 已实现 |
+| 流式输出优化 P5（audio_head CUDA Graph）| 小 | 低 | ✅ 已实现 |
+| **MVP Level 0（A audio-out + B barge-in）** | 小 | 低 | **进行中，快速出可演示成果** |
+| MVP Level 1（多轮一致，RadixCache 前缀复用）| 小 | 低 | 依赖 Level 0，多为配置/确定性保证 |
+| 流式 P1（vocoder overlap）、P4（vocoder CUDA Graph）| 中 | 中/高 | 需 GPU 验证 |
+| 全双工 Level 2（序列内增量续接 / parallel generation）| 大 | 高 | 需 GPU，独立里程碑 |

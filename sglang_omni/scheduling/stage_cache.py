@@ -20,26 +20,21 @@ def _detach_value(
     *,
     device: torch.device | None,
     pin: bool = False,
-    stream: "torch.cuda.Stream | None" = None,
 ) -> Any:
     if isinstance(value, torch.Tensor):
         value = value.detach()
         if device is not None:
-            # Offload to pinned host memory so the later relay H2D can overlap;
-            # the D2H itself runs on an optional side stream.
+            # Offload to pinned host memory so the later relay H2D can overlap.
             to_cpu = device.type == "cpu"
             if to_cpu and pin and value.device.type == "cuda":
                 staging = torch.empty_like(
                     value, device=device, pin_memory=True
                 )
-                if stream is not None:
-                    stream.wait_stream(torch.cuda.current_stream(value.device))
-                    with torch.cuda.stream(stream):
-                        staging.copy_(value, non_blocking=True)
-                    value.record_stream(stream)
-                    stream.synchronize()
-                else:
-                    staging.copy_(value)
+                # Synchronous D2H: put() is a sync call, so we cannot return
+                # before the copy completes. A side stream here would need an
+                # event waited on at get() time to actually overlap; until that
+                # exists, copy on the current stream and let it complete.
+                staging.copy_(value)
                 value = staging
             else:
                 value = value.to(device=device)
@@ -48,12 +43,12 @@ def _detach_value(
         return value
     if isinstance(value, dict):
         return {
-            key: _detach_value(item, device=device, pin=pin, stream=stream)
+            key: _detach_value(item, device=device, pin=pin)
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple)):
         return type(value)(
-            _detach_value(item, device=device, pin=pin, stream=stream) for item in value
+            _detach_value(item, device=device, pin=pin) for item in value
         )
     return value
 
@@ -82,7 +77,6 @@ class StageOutputCache:
         cache_device: torch.device | str | None = None,
         size_fn: Callable[[Any], int] | None = None,
         pin_memory: bool = False,
-        use_side_stream: bool = True,
     ) -> None:
         if isinstance(cache_device, str):
             cache_device = torch.device(cache_device)
@@ -97,9 +91,6 @@ class StageOutputCache:
         self.pin_memory = bool(
             pin_memory and cache_device is not None and cache_device.type == "cpu"
         )
-        self._side_stream: torch.cuda.Stream | None = None
-        if self.pin_memory and use_side_stream and torch.cuda.is_available():
-            self._side_stream = torch.cuda.Stream()
 
     def get(self, key: str | None) -> Any | None:
         if key is None:
@@ -126,7 +117,6 @@ class StageOutputCache:
                 data,
                 device=self.cache_device,
                 pin=self.pin_memory,
-                stream=self._side_stream,
             ),
             size_bytes=size_bytes,
         )
