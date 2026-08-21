@@ -25,11 +25,8 @@ def _detach_value(
     if isinstance(value, torch.Tensor):
         value = value.detach()
         if device is not None:
-            # Offload path (e.g. GPU -> CPU). When copying to CPU we can land the
-            # tensor in page-locked (pinned) memory so the later relay H2D can run
-            # asynchronously (non_blocking) and overlap with compute. The D2H copy
-            # itself is issued on an optional side stream so it does not block the
-            # encoder's main compute stream.
+            # Offload to pinned host memory so the later relay H2D can overlap;
+            # the D2H itself runs on an optional side stream.
             to_cpu = device.type == "cpu"
             if to_cpu and pin and value.device.type == "cuda":
                 staging = torch.empty_like(
@@ -39,7 +36,6 @@ def _detach_value(
                     stream.wait_stream(torch.cuda.current_stream(value.device))
                     with torch.cuda.stream(stream):
                         staging.copy_(value, non_blocking=True)
-                    # Keep the source alive until the side-stream copy completes.
                     value.record_stream(stream)
                     stream.synchronize()
                 else:
@@ -75,10 +71,8 @@ def _value_size_bytes(value: Any) -> int:
 class StageOutputCache:
     """Small in-memory LRU cache for non-AR stage outputs.
 
-    When ``cache_device`` is set to CPU and ``pin_memory=True``, cached tensors
-    are offloaded to page-locked host memory. This frees the producing GPU's
-    memory while keeping the later relay H2D asynchronous (the consumer can copy
-    with ``non_blocking=True``). See docs/cookbook/开发文档_phase4_design.md §1.5.
+    With ``cache_device="cpu"`` and ``pin_memory=True``, cached tensors are
+    offloaded to pinned host memory to free the producing GPU.
     """
 
     def __init__(

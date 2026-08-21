@@ -100,10 +100,7 @@ class LongcatNextModelRunner(ModelRunner):
                         f"need {selected_count}, got {int(chunk.shape[0])}"
                     )
                 local_positions = selected_positions - chunk_global_start + int(batch_start)
-                # Phase 4 §1.5.4: when the encoder cache is offloaded to pinned
-                # host memory, this H2D can run asynchronously and overlap with
-                # the prefill's preceding ops. non_blocking is a no-op when the
-                # source is already on-device or in pageable memory.
+                # non_blocking lets a pinned (offloaded) source H2D overlap; no-op otherwise.
                 replace_embeds_parts.append(chunk.to(device=device, non_blocking=True))
                 replace_positions_parts.append(
                     local_positions.to(device=device, non_blocking=True)

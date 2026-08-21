@@ -17,6 +17,8 @@ Reference
 
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import nn
 
@@ -319,6 +321,59 @@ class LongcatNextAudioHead(nn.Module):
 
         self.eval()
 
+        # Optional CUDA-graph capture of the 8-step decode loop, keyed by batch
+        # size. Default off; enable via SGLANG_OMNI_LONGCAT_AUDIO_HEAD_CUDA_GRAPH.
+        self._graph_enabled = os.getenv(
+            "SGLANG_OMNI_LONGCAT_AUDIO_HEAD_CUDA_GRAPH", ""
+        ).lower() in ("1", "true", "yes", "on")
+        self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._graph_in: dict[int, torch.Tensor] = {}
+        self._graph_out: dict[int, torch.Tensor] = {}
+
+    def _decode_loop(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        """Pure 8-step causal codebook prediction (graph-capturable).
+
+        Depends only on ``hidden_state``: causal masking makes codebook ``k``
+        attend to cols ``0..k-1`` (written earlier in this loop), so the codes
+        buffer is zero-initialised and never reads external state.
+        """
+        bs = hidden_state.shape[0]
+        codes = torch.zeros(
+            bs, self.num_codebooks, dtype=torch.long, device=hidden_state.device,
+        )
+        for codebook_id in range(self.num_codebooks):
+            logits = self.audio_head(
+                hidden_state, codes, self.audio_emb_layers, bs, codebook_id,
+            )
+            codes[:, codebook_id] = torch.argmax(logits, dim=-1)
+        return codes
+
+    def _decode_loop_graphed(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        """Run :meth:`_decode_loop` through a per-batch-size CUDA graph."""
+        bs = hidden_state.shape[0]
+        graph = self._graphs.get(bs)
+        if graph is None:
+            # Warm up on a side stream, then capture (standard PyTorch recipe).
+            static_in = hidden_state.clone()
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(3):
+                    self._decode_loop(static_in)
+            torch.cuda.current_stream().wait_stream(side)
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                static_out = self._decode_loop(static_in)
+            self._graphs[bs] = graph
+            self._graph_in[bs] = static_in
+            self._graph_out[bs] = static_out
+
+        self._graph_in[bs].copy_(hidden_state)
+        graph.replay()
+        # Clone so callers own the result independent of the static buffer.
+        return self._graph_out[bs].clone()
+
     @torch.no_grad()
     def forward(
         self,
@@ -329,27 +384,16 @@ class LongcatNextAudioHead(nn.Module):
 
         Args:
             hidden_state: LLM last-layer output  ``[B, hidden_size]``.
-            prev_audio_codes: optional previous-step codes  ``[B, num_codebooks]``
-                for cumsum embedding context.  Zeros when omitted.
+            prev_audio_codes: unused (kept for API compatibility); the loop is
+                self-contained given ``hidden_state`` thanks to causal masking.
 
         Returns:
             Predicted codes  ``[B, num_codebooks]`` (int64, on the same device).
         """
-        bs = hidden_state.shape[0]
-        if prev_audio_codes is None:
-            prev_audio_codes = torch.zeros(
-                bs, self.num_codebooks,
-                dtype=torch.long, device=hidden_state.device,
-            )
-
-        for codebook_id in range(self.num_codebooks):
-            logits = self.audio_head(
-                hidden_state, prev_audio_codes,
-                self.audio_emb_layers, bs, codebook_id,
-            )
-            prev_audio_codes[:, codebook_id] = torch.argmax(logits, dim=-1)
-
-        return prev_audio_codes
+        del prev_audio_codes
+        if self._graph_enabled and hidden_state.is_cuda:
+            return self._decode_loop_graphed(hidden_state)
+        return self._decode_loop(hidden_state)
 
     @torch.no_grad()
     def build_input_embedding(

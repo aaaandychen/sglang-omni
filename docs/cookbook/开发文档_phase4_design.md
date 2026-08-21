@@ -172,43 +172,58 @@ text_ar decode(每步 8 codes)
 
 ### 2.2 已识别瓶颈与优化
 
-#### P1. Vocoder D2H 阻塞（收益最大，有现成参考）
+#### P1. Vocoder D2H 阻塞（收益最大，有现成参考）⏸ 暂缓（需 GPU 验证）
 
-**问题**：`code2wav.py:166` 的 `wav.cpu()` 是阻塞 D2H，卡住下一个 buffer 的 vocoder launch。
+**问题**：`code2wav.py:166` 的 `wav.cpu()` 是阻塞 D2H，卡住下一个 buffer 的 vocoder launch。（涉及 CUDA stream/event 双缓冲的正确性，无 GPU 环境无法验证，暂缓。）
 
 **优化**：借鉴 `origin/main` commit `b79b1e0`（"Overlap Code2Wav output materialization with vocoder launches"）—— 把 PCM 的 D2H materialization 与下一次 vocoder launch overlap，用独立 CUDA stream + event 同步。
 
-#### P2. 逐帧跨进程 relay 开销
+#### P2. 逐帧跨进程 relay 开销 ❌ 不做（收益边际、代码核对后证伪）
 
-**问题**：`_audio_stream_builder`（`stages.py:686`）每个 decode step 发一个 `OutgoingMessage`，每帧仅 8 个 int64，帧太小、次数太多，序列化开销占比高。
+**原描述**：`_audio_stream_builder` 每 decode step 发一个 `OutgoingMessage`，"逐帧 D2H + 序列化开销高"。
 
-**优化**：在 text_ar 侧先攒 N 帧再发（streaming chunk coalescing），参考 `origin/main` commit `efad721`（Moss streaming chunk coalescing）。
+**代码核对结论（原描述被证伪）**：真正的 D2H 早在 `model_runner.py` 的 `post_decode` 就做了（`new_audio_codes[i].cpu()`），`_longcat_latest_audio_codes` 存的已是 CPU 张量；`_audio_stream_builder` 里的 `codes.cpu()` 作用在已 CPU 张量上，是 **no-op**，不存在"逐帧 D2H 阻塞"。
 
-#### P3. 固定窗口 `_STREAM_FRAMES=20` 首包延迟高
+**为何不做**：唯一剩下的点是消息合并（coalescing），但 (1) 每消息载荷仅 8×int64 = **64 字节**，瓶颈是每消息 IPC 而非带宽，相对下游 vocoder 解码微不足道；(2) 消费端 code2wav 的 `_buffers` **本就在攒帧**，coalescing 只是把攒帧位置从消费端挪到生产端，省不了实质计算；(3) 生产端每步只存最新一帧、消费端按单帧 append，coalesce 需改**跨进程双端 shape 契约**且离线不可验证。收益边际 + 风险不划算 → 不做。
 
-**问题**：`stages.py:805` 硬编码 20 帧才出第一个 PCM chunk，首字延迟（TTFA）与吞吐矛盾。
+#### P3. 固定窗口 `_STREAM_FRAMES=20` 首包延迟高 ✅ 已实现
 
-**优化**：**渐进式窗口** —— 首 chunk 用小窗口（如 5 帧）抢首包延迟，后续逐步放大到 20/40 帧提吞吐。窗口大小由环境变量可调。
+**问题**：原 `stages.py` 硬编码 20 帧才出第一个 PCM chunk，首字延迟（TTFA）与吞吐矛盾。
 
-#### P4. Vocoder 未做 CUDA Graph capture
+**优化（已落地）**：**渐进式窗口** —— 首 chunk 用小窗口（默认 5 帧）抢首包延迟，之后每次 emit 按 growth 倍数放大（默认 ×2）直至 steady（默认 20 帧）提吞吐。per-request 维护当前阈值，flush 时释放。窗口三参数均可用环境变量调：
+```
+SGLANG_OMNI_LONGCAT_STREAM_FRAMES=20         # steady 稳态窗口
+SGLANG_OMNI_LONGCAT_STREAM_FRAMES_FIRST=5    # 首包窗口(≤steady)
+SGLANG_OMNI_LONGCAT_STREAM_FRAMES_GROWTH=2   # 增长倍数(1=关闭 ramp)
+```
+实现见 `stages.py`：`_stream_window_config` / `_current_threshold` / `_advance_threshold` + `on_stream_chunk`。默认值下首包延迟从 20 帧降到 5 帧（约 4×），稳态吞吐不变。
 
-**问题**：flow matching + HiFi-GAN 是固定 shape 的小 batch，目前每帧窗口都是 eager launch。
+#### P4. Vocoder 未做 CUDA Graph capture ⏸ 暂缓（shape 不固定，风险高）
 
-**优化**：对固定窗口的 vocoder forward 做 CUDA Graph capture。参考仓库根目录《再探 CUDA Graph：核心机制、多图复用以及 Dual AR 模型的统一覆盖优化》，多图复用思路适用于不同窗口大小。
+**问题**：flow matching + HiFi-GAN 每帧窗口 eager launch。
 
-#### P5. audio_head 8 步串行 argmax
+**为何暂缓**：P3 渐进窗口使输入帧数从 5 涨到 20（非固定 shape），且 flow matching 内部有 ODE solver 多步，图捕获需多图复用 + 固定步数，正确性无 GPU 无法验证。参考仓库根目录《再探 CUDA Graph》多图复用思路。
 
-**问题**：`audio_head.py:345-350` 每个 decode step 内部串行跑 8 次 codebook forward，占 decode 主循环开销。
+#### P5. audio_head 8 步串行 argmax ✅ 已实现（图捕获）
 
-**优化**：把 8 个 codebook 的 causal depth transformer forward 用一张 CUDA Graph 固定。
+**问题**：`audio_head.py` 每个 decode step 内部串行跑 8 次 codebook forward（含 flash-attn depth transformer），8 次 kernel launch 占 decode 主循环开销。
 
-### 2.3 优先级
+**为何可安全图捕获（理论正确性）**：
+- 固定 8 次迭代，捕获时完全展开；每个 batch size 一张图（shape 静态）
+- 循环内无 CPU 同步：`argmax` + slice 写入均为纯 GPU op，无 `.cpu()`/`.item()`/数据相关分支
+- **关键正确性**：因 causal mask，预测 codebook `k` 仅依赖列 `0..k-1`（循环内早已写入）+ LLM hidden，**不读入传入的 `prev_audio_codes`** → 只要图内零初始化 codes buffer，回放就自洽且不受上次残留值污染
+- 图内 RAW 依赖（步 `k` 读步 `<k` 的写入）由同一 stream 捕获保序；flash-attn 可图捕获
+
+**实现**：`_decode_loop`（纯函数，可捕获）+ `_decode_loop_graphed`（预热 3 次 → `torch.cuda.graph` 捕获 → replay，按 batch size 缓存）。输入静态 buffer `copy_` + 输出 `clone()` 保证调用方拥有独立结果。默认关，`SGLANG_OMNI_LONGCAT_AUDIO_HEAD_CUDA_GRAPH=1` 开启，非 CUDA / 未开启自动回退 eager。
+
+### 2.3 优先级与状态
 
 ```
-P1 vocoder overlap（收益最大、有现成参考）
-  > P2 relay coalescing
-  > P3 渐进窗口（改首包延迟）
-  > P4/P5 CUDA Graph
+P3 渐进窗口       ✅ 已实现（单进程、离线可验证、首包延迟 4×）
+P5 audio_head 图  ✅ 已实现（固定 8 步、理论可证、默认关）
+P1 vocoder overlap ⏸ 暂缓（CUDA stream/event 双缓冲正确性无 GPU 不可验证）
+P4 vocoder 图      ⏸ 暂缓（shape 随 P3 变化，需多图复用）
+P2 relay coalescing ❌ 不做（载荷 64B、消费端已 buffer、收益边际、跨进程双端契约风险）
 ```
 
 ### 2.4 涉及文件
@@ -217,7 +232,7 @@ P1 vocoder overlap（收益最大、有现成参考）
 |---|---|
 | `models/longcat_next/components/code2wav.py` | P1 D2H overlap、P4 vocoder CUDA Graph |
 | `models/longcat_next/stages.py` | P2 coalescing、P3 渐进窗口 |
-| `models/longcat_next/components/audio_head.py` | P5 audio_head CUDA Graph |
+| `models/longcat_next/components/audio_head.py` | P5 audio_head CUDA Graph ✅ |
 
 ---
 

@@ -23,26 +23,17 @@ def _audio_output_enabled() -> bool:
 _ENCODER_CACHE_MAX_SIZE = 256
 _ENCODER_CACHE_MAX_BYTES = 1024 * 1024 * 1024  # 1 GiB
 
-# Phase 4 §1: optionally offload the encoder-output cache to pinned host memory
-# to free encoder-GPU memory. Default off (keeps tensors on the producing GPU).
-#   SGLANG_OMNI_LONGCAT_ENCODER_CACHE_DEVICE = gpu|cpu   (default gpu)
-#   SGLANG_OMNI_LONGCAT_ENCODER_CACHE_MAX_BYTES = <bytes>  (offload budget)
+# Optionally offload the encoder-output cache to pinned host memory (default off).
 _ENV_ENCODER_CACHE_DEVICE = "SGLANG_OMNI_LONGCAT_ENCODER_CACHE_DEVICE"
 _ENV_ENCODER_CACHE_MAX_BYTES = "SGLANG_OMNI_LONGCAT_ENCODER_CACHE_MAX_BYTES"
 
 
 def _encoder_cache_device() -> str | None:
-    """Return "cpu" when offload is requested, else None (keep on GPU)."""
     value = os.getenv(_ENV_ENCODER_CACHE_DEVICE, "").strip().lower()
     return "cpu" if value == "cpu" else None
 
 
 def _encoder_cache_max_bytes() -> int:
-    """Byte budget for the encoder cache.
-
-    When offloading to CPU the host budget can be larger than encoder-GPU
-    memory, so honor an override; otherwise fall back to the GPU default.
-    """
     raw = os.getenv(_ENV_ENCODER_CACHE_MAX_BYTES, "").strip()
     if raw:
         try:
@@ -55,7 +46,6 @@ def _encoder_cache_max_bytes() -> int:
 
 
 def _build_encoder_cache() -> StageOutputCache:
-    """Construct the per-stage encoder-output cache, honoring offload env vars."""
     device = _encoder_cache_device()
     return StageOutputCache(
         max_size=_ENCODER_CACHE_MAX_SIZE,
@@ -63,6 +53,37 @@ def _build_encoder_cache() -> StageOutputCache:
         cache_device=device,
         pin_memory=device == "cpu",
     )
+
+
+# Progressive streaming decode window: small first window for low
+# time-to-first-audio, growing toward the steady window for throughput.
+_ENV_STREAM_FRAMES = "SGLANG_OMNI_LONGCAT_STREAM_FRAMES"
+_ENV_STREAM_FRAMES_FIRST = "SGLANG_OMNI_LONGCAT_STREAM_FRAMES_FIRST"
+_ENV_STREAM_FRAMES_GROWTH = "SGLANG_OMNI_LONGCAT_STREAM_FRAMES_GROWTH"
+_STREAM_FRAMES_DEFAULT = 20
+_STREAM_FRAMES_FIRST_DEFAULT = 5
+_STREAM_FRAMES_GROWTH_DEFAULT = 2
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %d", name, raw, default)
+        return default
+
+
+def _stream_window_config() -> tuple[int, int, int]:
+    """Return (first_window, steady_window, growth) for progressive streaming."""
+    steady = _env_int(_ENV_STREAM_FRAMES, _STREAM_FRAMES_DEFAULT)
+    first = _env_int(_ENV_STREAM_FRAMES_FIRST, _STREAM_FRAMES_FIRST_DEFAULT)
+    growth = _env_int(_ENV_STREAM_FRAMES_GROWTH, _STREAM_FRAMES_GROWTH_DEFAULT)
+    # First window must not exceed steady window.
+    first = min(first, steady)
+    return first, steady, growth
 
 
 # ---------------------------------------------------------------------------
@@ -835,7 +856,17 @@ def create_code2wav_executor(
 
     # Per-request ring buffers: list of [8] code tensors.
     _buffers: dict[str, list[torch.Tensor]] = collections.defaultdict(list)
-    _STREAM_FRAMES = 20  # decode every 20 audio frames
+    # Progressive per-request decode window (threshold grows toward steady).
+    _STREAM_FIRST, _STREAM_STEADY, _STREAM_GROWTH = _stream_window_config()
+    _stream_thresholds: dict[str, int] = {}
+
+    def _current_threshold(rid: str) -> int:
+        return _stream_thresholds.get(rid, _STREAM_FIRST)
+
+    def _advance_threshold(rid: str) -> None:
+        cur = _stream_thresholds.get(rid, _STREAM_FIRST)
+        if cur < _STREAM_STEADY:
+            _stream_thresholds[rid] = min(_STREAM_STEADY, cur * _STREAM_GROWTH)
 
     def _wav_to_result(wav: torch.Tensor | None) -> dict[str, Any]:
         result: dict[str, Any] = {"text": "", "modality": "audio", "usage": {}}
@@ -866,6 +897,7 @@ def create_code2wav_executor(
         if rid in _buffers:
             # Streaming request — flush remaining buffered frames.
             remaining = _buffers.pop(rid, [])
+            _stream_thresholds.pop(rid, None)
             wav = None
             if remaining:
                 codes = torch.stack(remaining).unsqueeze(0).to(device=device)
@@ -918,15 +950,16 @@ def create_code2wav_executor(
             )
 
         def on_stream_chunk(self, request_id: str, item) -> list[OutgoingMessage]:
-            """Handle each audio frame: buffer, decode every N frames."""
+            """Buffer each audio frame; decode once the progressive window fills."""
             codes = item.data if not isinstance(item, (str, bytes)) else item
             if not isinstance(codes, torch.Tensor):
                 return []
             _buffers[request_id].append(codes.cpu() if codes.is_cuda else codes)
-            if len(_buffers[request_id]) < _STREAM_FRAMES:
+            if len(_buffers[request_id]) < _current_threshold(request_id):
                 return []
 
             wav = _decode_buffer(request_id)
+            _advance_threshold(request_id)
             if wav is None:
                 return []
             r = _wav_to_result(wav)
