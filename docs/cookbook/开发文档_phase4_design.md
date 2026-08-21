@@ -400,4 +400,7 @@ flowchart LR
 | **MVP Level 0（A audio-out + B barge-in）** | 小 | 低 | **进行中，快速出可演示成果** |
 | MVP Level 1（多轮一致，RadixCache 前缀复用）| 小 | 低 | 依赖 Level 0，多为配置/确定性保证 |
 | 流式 P1（vocoder overlap）、P4（vocoder CUDA Graph）| 中 | 中/高 | 需 GPU 验证 |
-| 全双工 Level 2（序列内增量续接 / parallel generation）| 大 | 高 | 需 GPU，独立里程碑 |
+| **伪全双工延迟优化（Level 0 打磨）** | 中 | 低/中 | **见 Phase 5 文档：`开发文档_phase5_伪全双工延迟优化设计.md`** |
+| 全双工 Level 2（序列内增量续接 / parallel generation）| 大 | 高 | 需 GPU，独立里程碑（换模型/重训，非本框架层） |
+
+> **重要结论（Phase 5 前置）**：LongCat-Next 是 turn-based 模型，输出状态机无"听"状态，**框架层做不出真全双工**（官方 Omni-Flow 亦只做 cancel 式 barge-in）。真全双工需换模型（如 Moshi）或重训。因此后续方向是**把 Level 0 的延迟压到极致，做"伪全双工体感"**，详见 Phase 5 设计文档。

@@ -54,6 +54,64 @@
   let respondingTurnItemId = null;       // item_id of the response currently streaming
   const TARGET_SR = 16000;
 
+  // ── P1 assistant audio playback ──
+  // Server streams response.audio.delta as base64 PCM16 mono @ 24 kHz. We
+  // schedule each chunk back-to-back on a dedicated AudioContext and track
+  // live sources so a barge-in (response.audio.flush) can stop playback
+  // instantly — the core of the "open your mouth, it shuts up" feel.
+  const PLAYBACK_SR = 24000;
+  let playbackCtx = null;
+  let playbackCursor = 0;                // next scheduled start time (ctx clock)
+  const scheduledSources = new Set();    // live AudioBufferSourceNodes
+
+  function ensurePlaybackCtx() {
+    if (!playbackCtx) {
+      playbackCtx = new (window.AudioContext || window.webkitAudioContext)({
+        sampleRate: PLAYBACK_SR,
+      });
+      playbackCursor = playbackCtx.currentTime;
+    }
+    return playbackCtx;
+  }
+
+  function enqueueAudioChunk(b64) {
+    const ctx = ensurePlaybackCtx();
+    const bytes = base64ToBytes(b64);
+    const pcm16 = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength >> 1);
+    const n = pcm16.length;
+    if (n === 0) return;
+    const buffer = ctx.createBuffer(1, n, PLAYBACK_SR);
+    const ch = buffer.getChannelData(0);
+    for (let i = 0; i < n; i++) ch[i] = pcm16[i] / 0x8000;
+    const src = ctx.createBufferSource();
+    src.buffer = buffer;
+    src.connect(ctx.destination);
+    // Schedule back-to-back; if we've fallen behind, resync to now.
+    const startAt = Math.max(playbackCursor, ctx.currentTime);
+    src.start(startAt);
+    playbackCursor = startAt + buffer.duration;
+    scheduledSources.add(src);
+    src.onended = () => scheduledSources.delete(src);
+  }
+
+  function flushPlayback() {
+    // Barge-in: stop and drop everything already scheduled/buffered so the
+    // assistant goes silent immediately.
+    for (const src of scheduledSources) {
+      try { src.onended = null; src.stop(); } catch (_) {}
+    }
+    scheduledSources.clear();
+    if (playbackCtx) playbackCursor = playbackCtx.currentTime;
+  }
+
+  function base64ToBytes(b64) {
+    const binary = atob(b64);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes;
+  }
+
   // ─────────────────────  Status helpers  ─────────────────────
 
   function setStatus(text, mode = "") {
@@ -227,6 +285,9 @@
       micStream.getTracks().forEach((t) => t.stop());
       micStream = null;
     }
+    // Tear down assistant playback too.
+    flushPlayback();
+    if (playbackCtx) { playbackCtx.close(); playbackCtx = null; }
     if (drawRaf) {
       cancelAnimationFrame(drawRaf);
       drawRaf = 0;
@@ -320,6 +381,9 @@
       case "input_audio_buffer.speech_started":
         ensureTurn(evt.item_id);
         setTurnMeta(evt.item_id, `started ${ms(evt.audio_start_ms)}`);
+        // P1 barge-in: user opened their mouth — drop any assistant audio
+        // still buffered locally so it stops the instant we start speaking.
+        flushPlayback();
         return;
 
       case "input_audio_buffer.speech_stopped":
@@ -346,6 +410,19 @@
         if (respondingTurnItemId) {
           appendToBody(respondingTurnItemId, "assistant-body", evt.delta || "");
         }
+        return;
+
+      // ── Assistant audio (P1) ──
+      case "response.audio.delta":
+        if (evt.delta) enqueueAudioChunk(evt.delta);
+        return;
+
+      case "response.audio.done":
+        return;
+
+      case "response.audio.flush":
+        // Server-signalled barge-in truncation — stop playback immediately.
+        flushPlayback();
         return;
 
       case "response.text.done":

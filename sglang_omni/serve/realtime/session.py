@@ -3,9 +3,30 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import logging
+import os
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# Env-gated latency timing (Phase 5). When enabled, per-turn latency markers
+# (TTFA, server-side barge-in stop) are logged. Zero overhead when off.
+_TIMING = os.environ.get("SGLANG_OMNI_REALTIME_TIMING", "0") == "1"
+
+
+def _now_ms() -> float:
+    return time.monotonic() * 1000.0
+
+
+def _log_timing(label: str, start_ms: float, **extra: Any) -> None:
+    if not _TIMING:
+        return
+    dt = _now_ms() - start_ms
+    tail = " ".join(f"{k}={v}" for k, v in extra.items())
+    logger.info("[realtime-timing] %s=%.1fms %s", label, dt, tail)
 
 from fastapi import WebSocket
 from starlette.websockets import WebSocketState
@@ -55,6 +76,11 @@ def new_id(prefix: str) -> str:
 class ConversationItem:
     role: str  # "user" | "assistant"
     text: str
+    # P3/P4: a user item is created (empty, pending=True) at turn start to
+    # preserve chronological ordering, then filled by the background
+    # transcription task. Pending items are skipped when building request
+    # history until their text arrives.
+    pending: bool = False
 
 
 class RealtimeSession:
@@ -63,11 +89,19 @@ class RealtimeSession:
     Per turn (VAD ``speech_stopped`` → auto-commit):
       1. ``run_response`` consumes the audio + prior conversation, streams
          ``response.*`` events to the client. User sees their reply fast.
-      2. ``run_transcription`` re-consumes the audio with a verbatim-transcribe
-         prompt, streams ``conversation.item.input_audio_transcription.*`` for
-         history/UI/log.
-      3. Both transcript (user) and response (assistant) are appended to
-         ``self.conversation`` so the next turn has full text context.
+      2. A pending user history slot is reserved BEFORE the response so
+         chronological ordering is preserved (P3).
+      3. ``run_transcription`` runs as a BACKGROUND task (off the TTFA
+         critical path, P3), re-consuming the audio with a verbatim-transcribe
+         prompt and filling the reserved user slot when done.
+
+    Latency optimizations (Phase 5 pseudo-full-duplex):
+      * P0: barge-in emits ``speech_started`` + ``response.audio.flush``
+        immediately, aborting the prior response in the background; the next
+        turn waits on that abort via a barrier in ``drain_queue``.
+      * P2: adaptive VAD end-pointing (see ``vad.py``).
+      * P4: deterministic history prefix so RadixCache prefill hits.
+      * P5: optional env-gated streaming partial transcription for live UI.
     """
 
     def __init__(
@@ -102,6 +136,23 @@ class RealtimeSession:
         # earlier utterance — serialize via FIFO.
         self.response_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self.queue_drainer: asyncio.Task | None = None
+        # P0 barge-in: cancel/abort of the previous in-flight response runs in
+        # the background so ``speech_started`` is emitted immediately. The next
+        # turn must wait on this barrier before starting (avoid new/old req
+        # racing for KV). ``None`` when no abort is pending.
+        self._pending_abort: asyncio.Task | None = None
+        # P3: transcription runs off the TTFA critical path as a background
+        # task. Tracked so teardown can cancel any still-running transcribe.
+        self._bg_tasks: set[asyncio.Task] = set()
+        # P5 (optional, env-gated): streaming ASR — emit partial transcripts of
+        # the CURRENT utterance while the user is still speaking, purely for UI
+        # (does not feed the response). Off by default; extra ASR compute.
+        self._streaming_asr = (
+            os.environ.get("SGLANG_OMNI_REALTIME_STREAMING_ASR", "0") == "1"
+        )
+        self._partial_interval_ms = 400.0  # throttle partial ASR passes
+        self._last_partial_ms = 0.0
+        self._partial_task: asyncio.Task | None = None
 
         # VAD is created once with default config; session.update doesn't
         # touch it. Reconnect to change VAD params.
@@ -148,6 +199,19 @@ class RealtimeSession:
         )
         assert candidate.input_audio_format == "pcm16", "Only pcm16 is supported"
         self.session_object = candidate
+        # P2: apply turn_detection tuning to the live VAD config. Only the
+        # fields the client set are overridden; adaptive end-pointing stays on.
+        td = candidate.turn_detection
+        if td is not None:
+            cfg = self.vad.config
+            if td.threshold is not None:
+                cfg.threshold = td.threshold
+            if td.prefix_padding_ms is not None:
+                cfg.prefix_padding_ms = td.prefix_padding_ms
+            if td.silence_duration_ms is not None:
+                cfg.silence_duration_ms = td.silence_duration_ms
+                # Reset the adaptive baseline to the newly requested value.
+                self.vad.effective_silence_ms = td.silence_duration_ms
         await self.send(
             make_event(
                 "session.updated",
@@ -161,19 +225,77 @@ class RealtimeSession:
         emits = await asyncio.to_thread(self.vad.process, new_bytes)
         for emit in emits:
             await self.handle_vad_emit(emit)
+        # P5 streaming ASR: while the user is mid-utterance, periodically kick a
+        # partial transcription of the audio-so-far for live UI. Throttled and
+        # single-flight so it never piles up or blocks ingestion.
+        if self._streaming_asr and self.vad.is_speech:
+            await self._maybe_emit_partial_transcript()
+
+    async def _maybe_emit_partial_transcript(self) -> None:
+        now = _now_ms()
+        if now - self._last_partial_ms < self._partial_interval_ms:
+            return
+        if self._partial_task is not None and not self._partial_task.done():
+            return  # single-flight: previous partial still running
+        self._last_partial_ms = now
+        start_byte = self.utterance_start_byte or 0
+        end_byte = self.audio_buffer.num_bytes
+        if end_byte <= start_byte:
+            return
+        item_id = self.utterance_item_id or new_id("item")
+        payload = self.audio_buffer.to_sliced_wav_data_uri(
+            start_byte=start_byte, end_byte=end_byte
+        )
+        self._partial_task = asyncio.create_task(
+            self._run_partial_transcript(item_id, payload)
+        )
+        self._bg_tasks.add(self._partial_task)
+        self._partial_task.add_done_callback(self._bg_tasks.discard)
+
+    async def _run_partial_transcript(self, item_id: str, payload: str) -> None:
+        """Fire-and-forget partial ASR pass; emits a delta for live UI only.
+        Uses a throwaway request id so it never collides with the response /
+        final-transcription request tracking."""
+        request_id = f"rt-partial-{self.session_id}-{uuid.uuid4().hex}"
+        text_acc: list[str] = []
+        try:
+            async for chunk in self.client.completion_stream(
+                self.build_transcription_request(payload),
+                request_id=request_id,
+            ):
+                if chunk.modality == "text" and chunk.text:
+                    text_acc.append(chunk.text)
+                if chunk.finish_reason is not None:
+                    break
+        except asyncio.CancelledError:
+            await self.client.abort(request_id)
+            raise
+        partial = "".join(text_acc)
+        if partial and not self.closed:
+            await self.send(
+                make_event(
+                    "conversation.item.input_audio_transcription.delta",
+                    item_id=item_id,
+                    content_index=0,
+                    delta=partial,
+                    partial=True,
+                )
+            )
 
     async def handle_vad_emit(self, emit: Any) -> None:
         timestamp_ms = offsets_to_ms(self.buffer_origin_samples + emit.sample_offset)
         if emit.event_type == VADEvent.SPEECH_STARTED:
-            # Barge-in: user started speaking while we're still responding.
-            # Cancel the in-flight response (abort engine req + cancel task)
-            # so the new utterance takes over. Turn-based drain_queue picks up
-            # the next committed utterance afterwards.
-            await self._cancel_and_abort(self.active_task, self.active_request_id)
-            # PCM16 mono: 2 bytes/sample.
-            vad_byte = max(0, emit.sample_offset * 2)
-            self.utterance_start_byte = min(vad_byte, self.audio_buffer.num_bytes)
+            # P0 Barge-in: user started speaking while we're still responding.
+            # Emit speech_started + audio flush IMMEDIATELY so the client stops
+            # playback without waiting for the engine abort round-trip; the
+            # abort itself is done in the background. The next turn waits on
+            # ``self._pending_abort`` (barrier in drain_queue) so new/old reqs
+            # don't race for KV.
+            self.utterance_start_byte = min(
+                max(0, emit.sample_offset * 2), self.audio_buffer.num_bytes
+            )
             self.utterance_item_id = new_id("item")
+            barge = self.active_task is not None and not self.active_task.done()
             await self.send(
                 make_event(
                     "input_audio_buffer.speech_started",
@@ -181,6 +303,21 @@ class RealtimeSession:
                     item_id=self.utterance_item_id,
                 )
             )
+            if barge:
+                # P1: tell the client to drop any buffered assistant audio now.
+                await self.send(
+                    make_event(
+                        "response.audio.flush",
+                        reason="barge_in",
+                    )
+                )
+                # P0: abort previous response in background (do not block).
+                prev_task, prev_rid = self.active_task, self.active_request_id
+                self._pending_abort = asyncio.create_task(
+                    self._cancel_and_abort(prev_task, prev_rid)
+                )
+                if _TIMING:
+                    logger.info("[realtime-timing] barge_in_signal_sent")
         elif emit.event_type == VADEvent.SPEECH_STOPPED:
             await self.send(
                 make_event(
@@ -230,34 +367,56 @@ class RealtimeSession:
     async def drain_queue(self) -> None:
         while not self.closed:
             item_id, payload = await self.response_queue.get()
+            # P0 barrier: if a barge-in triggered a background abort of the
+            # previous response, wait for it to finish releasing the engine
+            # request before starting the next turn (avoid KV races).
+            if self._pending_abort is not None:
+                await asyncio.gather(self._pending_abort, return_exceptions=True)
+                self._pending_abort = None
             self.active_task = asyncio.create_task(self.run_turn(item_id, payload))
             await asyncio.gather(self.active_task, return_exceptions=True)
             self.active_task = None
 
     async def run_turn(self, item_id: str, audio_payload: str) -> None:
-        """Pass 1: response (user-facing, streams fast).
-        Pass 2: transcription (background, fills history).
+        """Pass 1 (critical path): response — streams audio/text to the user.
+        Pass 2 (background): transcription — fills history/UI, off the TTFA
+        path so the next turn is not delayed by it (P3).
 
-        Both text results are committed to ``conversation`` in a ``finally`` so
-        a barge-in cancel that lands between the two passes (response done,
-        transcription in flight) still persists the completed response instead
-        of dropping the whole turn's context.
+        Chronological history is preserved by inserting an empty pending user
+        item BEFORE the assistant reply; the background transcription fills its
+        text in place. Pending items are skipped by request-building until
+        filled, so a not-yet-transcribed turn never corrupts the next prompt.
         """
+        # Reserve the user slot first (spoke first), then the assistant slot.
+        user_item = ConversationItem(role="user", text="", pending=True)
+        self.conversation.append(user_item)
         response_text = ""
-        transcript = ""
         try:
             response_text = await self.run_response(audio_payload)
-            transcript = await self.run_transcription(item_id, audio_payload)
         finally:
-            # Chronological order: user spoke first, assistant replied.
-            if transcript:
-                self.conversation.append(
-                    ConversationItem(role="user", text=transcript)
-                )
             if response_text:
                 self.conversation.append(
                     ConversationItem(role="assistant", text=response_text)
                 )
+        # P3: transcription off the critical path — next turn can start now.
+        task = asyncio.create_task(
+            self._background_transcribe(item_id, audio_payload, user_item)
+        )
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    async def _background_transcribe(
+        self, item_id: str, audio_payload: str, user_item: ConversationItem
+    ) -> None:
+        """Run the verbatim transcription pass off the TTFA critical path and
+        fill in the reserved user history slot (P3)."""
+        transcript = ""
+        try:
+            transcript = await self.run_transcription(item_id, audio_payload)
+        finally:
+            if transcript:
+                user_item.text = transcript
+            user_item.pending = False
 
     async def run_response(self, audio_payload: str) -> str:
         """Emit response.created → text.delta / audio.delta × N → done.
@@ -269,6 +428,8 @@ class RealtimeSession:
         response_id = new_id("resp")
         request_id = f"rt-{self.session_id}-{uuid.uuid4().hex}"
         self.active_request_id = request_id
+        turn_start_ms = _now_ms()
+        first_audio_logged = False
 
         try:
             await self.send(
@@ -307,6 +468,9 @@ class RealtimeSession:
                     )
                 elif chunk.modality == "audio" and chunk.audio_b64:
                     audio_emitted = True
+                    if not first_audio_logged:
+                        first_audio_logged = True
+                        _log_timing("ttfa", turn_start_ms, resp=response_id)
                     await self.send(
                         make_event(
                             "response.audio.delta",
@@ -432,7 +596,15 @@ class RealtimeSession:
                 content=self.session_object.instructions or DEFAULT_INSTRUCTIONS,
             )
         ]
+        # P4 RadixCache determinism: emit history in a fixed, deterministic
+        # order and SKIP pending (not-yet-transcribed) user items. This keeps
+        # the request prefix byte-identical as the conversation grows, so the
+        # prefix tree hits and prefill only pays for the new suffix. Any
+        # non-determinism here (ids, timestamps, reordering) would evict the
+        # cache and force a full recompute.
         for item in self.conversation:
+            if item.pending or not item.text:
+                continue
             messages.append(Message(role=item.role, content=item.text))
         messages.append(
             Message(
@@ -499,5 +671,14 @@ class RealtimeSession:
         self.closed = True
         await self._cancel_and_abort(self.active_task, self.active_request_id)
         await self._cancel_and_abort(self.queue_drainer, None)
+        # P0/P3: absorb any background barge-in abort and transcription tasks.
+        if self._pending_abort is not None:
+            await asyncio.gather(self._pending_abort, return_exceptions=True)
+            self._pending_abort = None
+        for task in list(self._bg_tasks):
+            task.cancel()
+        if self._bg_tasks:
+            await asyncio.gather(*self._bg_tasks, return_exceptions=True)
+            self._bg_tasks.clear()
         if self.websocket.client_state == WebSocketState.CONNECTED:
             await self.websocket.close()
