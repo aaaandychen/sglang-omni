@@ -23,6 +23,47 @@ def _audio_output_enabled() -> bool:
 _ENCODER_CACHE_MAX_SIZE = 256
 _ENCODER_CACHE_MAX_BYTES = 1024 * 1024 * 1024  # 1 GiB
 
+# Phase 4 §1: optionally offload the encoder-output cache to pinned host memory
+# to free encoder-GPU memory. Default off (keeps tensors on the producing GPU).
+#   SGLANG_OMNI_LONGCAT_ENCODER_CACHE_DEVICE = gpu|cpu   (default gpu)
+#   SGLANG_OMNI_LONGCAT_ENCODER_CACHE_MAX_BYTES = <bytes>  (offload budget)
+_ENV_ENCODER_CACHE_DEVICE = "SGLANG_OMNI_LONGCAT_ENCODER_CACHE_DEVICE"
+_ENV_ENCODER_CACHE_MAX_BYTES = "SGLANG_OMNI_LONGCAT_ENCODER_CACHE_MAX_BYTES"
+
+
+def _encoder_cache_device() -> str | None:
+    """Return "cpu" when offload is requested, else None (keep on GPU)."""
+    value = os.getenv(_ENV_ENCODER_CACHE_DEVICE, "").strip().lower()
+    return "cpu" if value == "cpu" else None
+
+
+def _encoder_cache_max_bytes() -> int:
+    """Byte budget for the encoder cache.
+
+    When offloading to CPU the host budget can be larger than encoder-GPU
+    memory, so honor an override; otherwise fall back to the GPU default.
+    """
+    raw = os.getenv(_ENV_ENCODER_CACHE_MAX_BYTES, "").strip()
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            logger.warning(
+                "Invalid %s=%r; falling back to default", _ENV_ENCODER_CACHE_MAX_BYTES, raw
+            )
+    return _ENCODER_CACHE_MAX_BYTES
+
+
+def _build_encoder_cache() -> StageOutputCache:
+    """Construct the per-stage encoder-output cache, honoring offload env vars."""
+    device = _encoder_cache_device()
+    return StageOutputCache(
+        max_size=_ENCODER_CACHE_MAX_SIZE,
+        max_bytes=_encoder_cache_max_bytes(),
+        cache_device=device,
+        pin_memory=device == "cpu",
+    )
+
 
 # ---------------------------------------------------------------------------
 # Encoder micro-batching helpers
@@ -254,11 +295,7 @@ def create_image_encoder_executor(
 
     with longcat_timing("image_encoder_executor_init", device=device, dtype=dtype):
         model = LongcatNextImageEncoder(model_path, device=device, dtype=dtype)
-    cache = StageOutputCache(
-        max_size=_ENCODER_CACHE_MAX_SIZE,
-        max_bytes=_ENCODER_CACHE_MAX_BYTES,
-        cache_device=None,
-    )
+    cache = _build_encoder_cache()
 
     # Micro-batching knobs (factory arg > env > default).
     batch_size = _resolve_batch_param(
@@ -411,11 +448,7 @@ def create_audio_encoder_executor(
 
     with longcat_timing("audio_encoder_executor_init", device=device, dtype=dtype):
         model = LongcatNextAudioEncoder(model_path, device=device, dtype=dtype)
-    cache = StageOutputCache(
-        max_size=_ENCODER_CACHE_MAX_SIZE,
-        max_bytes=_ENCODER_CACHE_MAX_BYTES,
-        cache_device=None,
-    )
+    cache = _build_encoder_cache()
 
     # Micro-batching knobs (factory arg > env > default).
     batch_size = _resolve_batch_param(

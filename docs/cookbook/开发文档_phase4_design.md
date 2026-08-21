@@ -33,6 +33,21 @@ cache = StageOutputCache(
 
 `StageOutputCache._detach_value` 在 `cache_device=None` 时不做设备迁移，因此缓存的 `visual_embeds` / `audio_embeds`（AR hidden-size 大张量）直接占用 GPU0 / GPU1 的显存，与 ViT / audio tokenizer 的 batch 空间争抢。
 
+**关键数据流（决定 offload 设计）**：encoder 输出并不在 encoder 进程内直接喂给 AR，而是走一条跨进程 relay：
+
+```
+encoder forward → result dict{visual_embeds/audio_embeds}
+  → _finalize_pending: state.encoder_outs[stage] = result + cache.put(key, result)
+  → merge.merge_for_text_ar: longcat_mm_inputs["image_embeds"] = visual_embeds
+  → TensorRef SHM relay (config.py: SGLANG_OMNI_TENSOR_REF_PATHS=visual_embeds,audio_embeds)
+  → AR 进程 model_runner.py:103: chunk.to(device=device)   ← 真正的 H2D 发生在这里
+```
+
+这条数据流有两个直接推论：
+
+1. **命中路径本来就要经过一次 H2D**（在 AR 侧 `model_runner.py:103`），而非 encoder 侧。所以把 cache 放 CPU **不会新增一次 H2D**，只是把"命中后从哪儿取"从 encoder GPU 换成 encoder 进程的 CPU pinned buffer —— 随后照旧走 TensorRef relay 到 AR。**offload 命中开销远低于"多一次完整 H2D"的直觉估计。**
+2. **cache 的最终消费者是 AR 进程，不是 encoder 进程**。因此 encoder 侧根本不需要把命中的张量再 upload 回 encoder GPU；它只需把 CPU 张量交给 relay 即可。所谓"命中时 re-upload"实际发生在 AR 侧、且**已经存在**。
+
 ### 1.2 目标
 
 将 encoder 输出缓存 offload 到 CPU（pinned memory），释放 encoder GPU 显存，命中时异步搬回 GPU。
@@ -46,37 +61,99 @@ cache = StageOutputCache(
 | 方案 | GPU 显存 | 命中延迟 | 适用场景 |
 |---|---|---|---|
 | GPU cache（现状） | 占 encoder GPU 1 GiB | 零拷贝，命中即用 | 显存宽裕、追求极致延迟 |
-| CPU offload | 释放 GPU 显存 | 命中多一次 H2D 拷贝 | 显存吃紧（68B MoE + KV cache 争抢） |
+| CPU offload | 释放 GPU 显存 | 命中时 encoder GPU 显存零占用；H2D 已在 AR 侧存在（§1.1），几乎无新增 | 显存吃紧（68B MoE + KV cache 争抢） |
 
 **判断**：在 LongCat-Next 场景下 offload 偏合理：
 1. Encoder GPU 上也要跑 ViT / audio tokenizer，1 GiB cache 挤占的是 encoder 自己的 batch 空间。
-2. Cache 命中的是输入侧（图片/音频文件），命中后本来就要走 relay 到 text_ar，多一次 H2D 相对占比不大。
+2. 命中的是输入侧（图片/音频文件），命中后本来就要走 relay 到 text_ar，H2D 在 AR 侧已存在（§1.1），offload 几乎不新增拷贝。
 3. Cache 张量最终归宿本就要经过 CPU relay（TensorRef/SHM），放 CPU 与下游数据流更顺。
 
-### 1.5 实现要点
+### 1.5 缓存索引 / Evict / 迁移 / 命中回传设计
 
-1. **环境变量门控**，默认关闭以保持向后兼容：
-   ```
-   SGLANG_OMNI_LONGCAT_ENCODER_CACHE_DEVICE=cpu   # 默认 "gpu"/None
-   ```
-2. **Pinned memory + 异步 H2D**：offload 后命中路径的同步 H2D 会抵消收益。应给 `StageOutputCache` 增加：
-   - `put()` 时把张量搬到 pinned CPU memory（`.pin_memory()`）
-   - `get()` 后由 encoder 侧用 `non_blocking=True` 异步搬回 GPU，与后续计算 overlap
-3. **不破坏 cache key 语义**：命中判定（`path+size+mtime_ns` 指纹）与设备无关，offload 不影响正确性。
+#### 1.5.1 索引：encoder 级别的 key 语义（保持不变）
 
-### 1.6 验证方法
+cache key 由 preprocessor 生成，是 `path + size + mtime_ns` 指纹（`preprocessor.py:176 _build_media_cache_key`），多文件拼接：
+
+```
+"{path}:{st_size}:{st_mtime_ns}"  逐文件拼接 → 整批一个 key
+```
+
+- **与设备无关**：key 只描述"输入内容"，offload 到 CPU 不改变命中判定，正确性无损。
+- **encoder 级隔离**：image / audio 各自持有独立 `StageOutputCache` 实例（`stages.py:257 / 414`），key 空间天然按 stage 隔离，无需额外前缀。
+- 索引结构仍是 `OrderedDict[key → _CacheEntry]`（LRU 序），offload 只改 entry 里张量的**驻留设备**，不改索引层。
+
+#### 1.5.2 Evict：字节预算按"设备侧"计量
+
+现状 `_evict_over_budget` 按 `max_size`(256) 和 `max_bytes`(1 GiB) 双约束 LRU 淘汰（`stage_cache.py:106`）。offload 后：
+
+- **`max_bytes` 语义从"GPU 显存预算"变为"CPU pinned 内存预算"**。pinned memory 是稀缺的锁页内存（不可换页），预算应独立配置，建议 offload 模式下调大（如 4 GiB），因为 CPU 内存比 encoder GPU 显存宽裕。
+- `_value_size_bytes` 计量与设备无关（只看 `numel * element_size`），evict 逻辑无需改动。
+- **淘汰即释放 pinned buffer**：evict 时应显式归还 pinned 内存到 pool（见 1.5.4），否则锁页内存泄漏比普通 GPU cache 更危险。
+
+#### 1.5.3 迁移（put，GPU→CPU offload）
+
+`put()` 时 `_detach_value(data, device="cpu")` 完成 D2H。要点：
+
+1. **落到 pinned memory**：普通 pageable CPU 张量的 H2D/D2H 无法与 compute overlap（driver 需先暂存到内部 pinned buffer，隐式同步）。必须 `.pin_memory()` 或预分配 pinned pool，才能让后续 relay 的 H2D 走异步 DMA。依据见 §1.6[1][3]。
+2. **D2H 异步化 + 不阻塞 encoder 主流**：offload 拷贝放独立 CUDA stream，用 event 让 encoder 下一个 batch 的 compute 不必等 D2H 完成。encoder 已经算出 result 并 `detach`，offload 是纯搬运，适合后台 stream。
+3. **写时机**：`put` 发生在 `_finalize_pending`，此时 result 已 detach，可安全在 side stream 上发起 D2H。
+
+#### 1.5.4 命中回传（get，CPU→relay，可 overlap）
+
+**先厘清 `model_runner.py:103` 的 `chunk.to(device)` 到底解决什么问题** —— 它有双重用途：
+
+1. **relay 落地设备 ≠ AR 计算设备**：relay 收到的张量落在 `relay.device`（`relay_io.py:592/599`）。shm / mooncake relay 落 **CPU**，NCCL relay 可落 **GPU**。当前多模态 TensorRef 走 shm relay（落 CPU），故 `:103` 这次 `.to(device)` 就是那唯一的一次 H2D。
+2. **chunked-prefill 惰性切片（关键，也是它"晚"的原因）**：`:95` 的 `chunk = embeds[offset : offset+selected_count]` 只取**当前 prefill chunk 覆盖的 token**，`:103` 只 upload 这一片，`_longcat_mm_consumed` 跨 chunk 记录消费偏移。长多模态序列被切成多步，每步只搬当前 chunk 的切片——**这是惰性上传**：省 AR GPU 显存 + 省无用带宽（还没轮到的 chunk 不上传），并非疏忽。
+
+**能否在 encoder 侧就 upload 到 AR GPU 来 overlap？** 能（relay 换 NCCL/mooncake GPU→GPU backend 即可，`relay.device` 变 AR GPU、`:103` 退化为 no-op），但与本章两个目标冲突：
+
+| 方案 | overlap | encoder GPU 显存 | AR GPU 显存 | 破坏 chunked 惰性 |
+|---|---|---|---|---|
+| 现状 `:103` 同步搬 | ❌ | 省（若 cache offload） | 省 | 否 |
+| encoder 侧 GPU→GPU 提前推整块 | ✅ | **不省**（起点仍是 encoder GPU） | 涨（整块常驻） | 是 |
+| **AR 侧 pinned + prefetch 下一片**（推荐） | ✅ | 省 | 省 | 否 |
+
+- encoder 侧提前推**同时破坏**"省 encoder GPU 显存"（本章 offload 初衷）和 chunked 惰性（整块常驻 AR GPU），不是纯赚。
+- **推荐方案**：把 `:103` 从"用时才同步搬"升级为"**prefetch 下一个 chunk 的切片**"——cache 命中拿到 **CPU pinned** 张量（§1.5.3 保证），AR 侧在当前 chunk forward 的同时，用 side stream `non_blocking=True` 异步预取下一 chunk 的切片 H2D。既保留 chunked 惰性（不整块占显存、不占 encoder GPU），又把 H2D 藏在 compute 后面，overlap 收益接近"encoder 提前推"。
+- **MVP 最小实现**：先把 `:103` 的 `.to(device)` 加 `non_blocking=True`（源为 pinned 时即可与 prefill 前置算子 overlap）；prefetch 下一 chunk 作为后续增强。
+
+#### 1.5.5 Pinned memory pool（避免反复 pin/unpin）
+
+`.pin_memory()` 每次都 `cudaHostAlloc`/`cudaHostRegister`，开销高且易碎片。参考 vLLM / DeepSpeed 做法（§1.6[2][4]）用**固定大小的 pinned buffer pool + 双缓冲**：
+
+- 预分配 N 块定长 pinned buffer，put 时从 pool 借、evict 时还，避免运行时反复 pin。
+- 双缓冲（double buffering）：一块正在被 relay 读，另一块接收下一次 offload 的 D2H，两者 overlap。
+
+### 1.6 开源实现依据
+
+1. **NVIDIA CUDA 最佳实践 —— pinned memory 是异步拷贝的前提**：pageable memory 的 `cudaMemcpyAsync` 会退化为同步（driver 需先 copy 到内部 pinned staging）；只有 page-locked (pinned) memory 才能与 kernel 执行真正并发。这是 1.5.3[1] 必须 pin 的根本依据。（*CUDA C++ Best Practices Guide — Asynchronous Transfers and Overlapping / Pinned Memory*）
+2. **vLLM CPU KV offloading** —— 用独立 offloading buffer（GiB 级预算）+ read/write 分离计量 + sync/async tiering，印证 1.5.2 的"独立字节预算"与 1.5.3 的"异步 tiering"设计。（*vLLM Engine Args: kv offloading buffer；vLLM release notes: split CPU cache read/write gauges, tiering sync/async histograms*）
+3. **PyTorch pinned-memory + `non_blocking=True` H2D overlap** —— 官方教程明确：源张量在 pinned memory 时，`.to(device, non_blocking=True)` 可与后续 GPU 计算 overlap，是 1.5.4 AR 侧 overlap 的标准手法。（*PyTorch tutorials: "A guide on good usage of non_blocking and pin_memory"*）
+4. **DeepSpeed ZeRO-Offload / Infinity 的 pinned buffer pool + prefetch double-buffer** —— 预分配定长 pinned buffer、借还复用、prefetch 与 compute overlap，是 1.5.5 pool 化双缓冲的成熟范式。（*DeepSpeed ZeRO-Infinity: 用 pinned memory pool 做 param/activation offload 的 overlap prefetch*）
+
+> 共识：offload 本身不难，难在**让 D2H/H2D 与 compute overlap**，而 overlap 的**硬前提是 pinned memory**；生产级实现（vLLM/DeepSpeed）都用**固定 pinned pool + 双缓冲/prefetch** 摊薄 pin 成本并隐藏传输延迟。
+
+### 1.7 验证方法
 
 `SGLANG_OMNI_LONGCAT_DEBUG_TIMING=1` 下，对比 offload 前后：
-- `encoder_cache action=hit` → `image_encoder_h2d` / `audio_encoder_h2d` 的耗时增量（量化 H2D 代价）
-- encoder GPU 的 `nvidia-smi` 显存占用下降幅度
-- 端到端 P50/P99 首字延迟是否回退
+- `encoder_cache action=hit` → AR 侧 `chunk.to(device)` 的 H2D 耗时（确认 pinned + non_blocking 是否 overlap 生效）
+- encoder GPU 的 `nvidia-smi` 显存占用下降幅度（预期释放约 1 GiB）
+- CPU pinned 内存占用是否在预算内、evict 是否正常归还 buffer
+- 端到端 P50/P99 首字延迟是否回退（overlap 达标应无明显回退）
 
-### 1.7 涉及文件
+### 1.8 实现要点与涉及文件
+
+**环境变量门控**，默认关闭以保持向后兼容：
+```
+SGLANG_OMNI_LONGCAT_ENCODER_CACHE_DEVICE=cpu     # 默认 gpu/None
+SGLANG_OMNI_LONGCAT_ENCODER_CACHE_MAX_BYTES=...  # offload 模式独立预算(建议调大)
+```
 
 | 文件 | 改动 |
 |---|---|
-| `scheduling/stage_cache.py` | 增加 pinned memory staging + 异步搬回 |
-| `models/longcat_next/stages.py` | `cache_device` 由环境变量解析 |
+| `scheduling/stage_cache.py` | `put` 走 pinned pool + side-stream D2H；evict 归还 pinned buffer；pinned buffer pool + 双缓冲 |
+| `models/longcat_next/stages.py` | 两处 `cache_device` 由环境变量解析；`max_bytes` 支持 offload 独立预算 |
+| `models/longcat_next/model_runner.py` | `:103` 的 `chunk.to(device)` 改 `non_blocking=True` 并与前置算子 overlap（命中回传的真正 overlap 点） |
 
 ---
 

@@ -15,16 +15,50 @@ class _CacheEntry:
     size_bytes: int
 
 
-def _detach_value(value: Any, *, device: torch.device | None) -> Any:
+def _detach_value(
+    value: Any,
+    *,
+    device: torch.device | None,
+    pin: bool = False,
+    stream: "torch.cuda.Stream | None" = None,
+) -> Any:
     if isinstance(value, torch.Tensor):
         value = value.detach()
         if device is not None:
-            value = value.to(device=device)
+            # Offload path (e.g. GPU -> CPU). When copying to CPU we can land the
+            # tensor in page-locked (pinned) memory so the later relay H2D can run
+            # asynchronously (non_blocking) and overlap with compute. The D2H copy
+            # itself is issued on an optional side stream so it does not block the
+            # encoder's main compute stream.
+            to_cpu = device.type == "cpu"
+            if to_cpu and pin and value.device.type == "cuda":
+                staging = torch.empty_like(
+                    value, device=device, pin_memory=True
+                )
+                if stream is not None:
+                    stream.wait_stream(torch.cuda.current_stream(value.device))
+                    with torch.cuda.stream(stream):
+                        staging.copy_(value, non_blocking=True)
+                    # Keep the source alive until the side-stream copy completes.
+                    value.record_stream(stream)
+                    stream.synchronize()
+                else:
+                    staging.copy_(value)
+                value = staging
+            else:
+                value = value.to(device=device)
+        elif pin and value.device.type == "cpu" and not value.is_pinned():
+            value = value.pin_memory()
         return value
     if isinstance(value, dict):
-        return {key: _detach_value(item, device=device) for key, item in value.items()}
+        return {
+            key: _detach_value(item, device=device, pin=pin, stream=stream)
+            for key, item in value.items()
+        }
     if isinstance(value, (list, tuple)):
-        return type(value)(_detach_value(item, device=device) for item in value)
+        return type(value)(
+            _detach_value(item, device=device, pin=pin, stream=stream) for item in value
+        )
     return value
 
 
@@ -39,7 +73,13 @@ def _value_size_bytes(value: Any) -> int:
 
 
 class StageOutputCache:
-    """Small in-memory LRU cache for non-AR stage outputs."""
+    """Small in-memory LRU cache for non-AR stage outputs.
+
+    When ``cache_device`` is set to CPU and ``pin_memory=True``, cached tensors
+    are offloaded to page-locked host memory. This frees the producing GPU's
+    memory while keeping the later relay H2D asynchronous (the consumer can copy
+    with ``non_blocking=True``). See docs/cookbook/开发文档_phase4_design.md §1.5.
+    """
 
     def __init__(
         self,
@@ -47,6 +87,8 @@ class StageOutputCache:
         max_bytes: int | None = None,
         cache_device: torch.device | str | None = None,
         size_fn: Callable[[Any], int] | None = None,
+        pin_memory: bool = False,
+        use_side_stream: bool = True,
     ) -> None:
         if isinstance(cache_device, str):
             cache_device = torch.device(cache_device)
@@ -57,6 +99,13 @@ class StageOutputCache:
         self.current_bytes = 0
         self.eviction_count = 0
         self._size_fn = size_fn or _value_size_bytes
+        # Pin only makes sense when offloading to host memory.
+        self.pin_memory = bool(
+            pin_memory and cache_device is not None and cache_device.type == "cpu"
+        )
+        self._side_stream: torch.cuda.Stream | None = None
+        if self.pin_memory and use_side_stream and torch.cuda.is_available():
+            self._side_stream = torch.cuda.Stream()
 
     def get(self, key: str | None) -> Any | None:
         if key is None:
@@ -79,7 +128,12 @@ class StageOutputCache:
         if self.max_bytes is not None and size_bytes > self.max_bytes:
             return
         self._cache[key] = _CacheEntry(
-            data=_detach_value(data, device=self.cache_device),
+            data=_detach_value(
+                data,
+                device=self.cache_device,
+                pin=self.pin_memory,
+                stream=self._side_stream,
+            ),
             size_bytes=size_bytes,
         )
         self.current_bytes += size_bytes
