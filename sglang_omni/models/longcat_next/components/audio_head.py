@@ -17,6 +17,7 @@ Reference
 
 from __future__ import annotations
 
+import logging
 import os
 
 import torch
@@ -24,13 +25,34 @@ from torch import nn
 
 from sglang_omni.models.longcat_next.components.encoders import _OffsetCodebookEmbedding
 from sglang_omni.models.longcat_next.payload_types import longcat_timing
-from sglang_omni.models.weight_loader import load_module, load_weights_by_prefix, resolve_dtype
+from sglang_omni.models.weight_loader import (
+    load_module,
+    load_weights_by_prefix,
+    resolve_dtype,
+)
+
+logger = logging.getLogger(__name__)
+
+# Batch-size ladder for audio-head CUDA-graph capture (SGLang-style bucketing).
+_GRAPH_BS_LADDER = (1, 2, 4, 8, 16, 32, 64, 128)
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %d", name, raw, default)
+        return default
 
 # flash_attn v4 compat bridge — ensure flash_attn_func is importable from the
 # top-level ``flash_attn`` namespace (moved to ``flash_attn.cute`` in v4).
 # ``components/dynamic.py`` also installs this bridge; the guard avoids a
 # redundant re-assignment when both modules are loaded.
 import flash_attn
+
 if not hasattr(flash_attn, "flash_attn_func"):
     import flash_attn.cute
     flash_attn.flash_attn_func = flash_attn.cute.flash_attn_func
@@ -321,14 +343,32 @@ class LongcatNextAudioHead(nn.Module):
 
         self.eval()
 
-        # Optional CUDA-graph capture of the 8-step decode loop, keyed by batch
-        # size. Default off; enable via SGLANG_OMNI_LONGCAT_AUDIO_HEAD_CUDA_GRAPH.
+        # Optional CUDA-graph capture of the 8-step decode loop. Default off;
+        # enable via SGLANG_OMNI_LONGCAT_AUDIO_HEAD_CUDA_GRAPH.
+        #
+        # Graphs are captured per batch-size BUCKET (power-of-two ladder), not
+        # per observed batch size: online traffic with a scattered bs
+        # distribution would otherwise accumulate one graph + static buffer
+        # pair per distinct bs, growing GPU memory without bound. Inputs are
+        # zero-padded up to the next bucket and outputs sliced back down.
         self._graph_enabled = os.getenv(
             "SGLANG_OMNI_LONGCAT_AUDIO_HEAD_CUDA_GRAPH", ""
         ).lower() in ("1", "true", "yes", "on")
+        self._graph_max_bs = _env_int(
+            "SGLANG_OMNI_LONGCAT_AUDIO_GRAPH_MAX_BS", _GRAPH_BS_LADDER[-1]
+        )
         self._graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self._graph_in: dict[int, torch.Tensor] = {}
         self._graph_out: dict[int, torch.Tensor] = {}
+        # One-shot flag so an over-cap batch size doesn't log every decode step.
+        self._graph_eager_logged = False
+
+    def _graph_bucket(self, bs: int) -> int | None:
+        """Smallest ladder step >= ``bs``, or ``None`` when beyond the cap."""
+        for step in _GRAPH_BS_LADDER:
+            if bs <= step:
+                return step if step <= self._graph_max_bs else None
+        return None
 
     def _decode_loop(self, hidden_state: torch.Tensor) -> torch.Tensor:
         """Pure 8-step causal codebook prediction (graph-capturable).
@@ -349,12 +389,37 @@ class LongcatNextAudioHead(nn.Module):
         return codes
 
     def _decode_loop_graphed(self, hidden_state: torch.Tensor) -> torch.Tensor:
-        """Run :meth:`_decode_loop` through a per-batch-size CUDA graph."""
+        """Run :meth:`_decode_loop` through a per-batch-bucket CUDA graph.
+
+        The input is zero-padded up to the next power-of-two bucket and the
+        output sliced back to the real batch size, so at most
+        ``len(_GRAPH_BS_LADDER)`` graphs/static buffers ever exist regardless
+        of how scattered the online batch-size distribution is. Batch rows are
+        independent in the decode loop (per-row codebook attention), so the
+        padding rows never affect the real rows. Batch sizes beyond the ladder
+        cap fall back to eager execution.
+        """
         bs = hidden_state.shape[0]
-        graph = self._graphs.get(bs)
+        bucket = self._graph_bucket(bs)
+        if bucket is None:
+            if not self._graph_eager_logged:
+                self._graph_eager_logged = True
+                logger.info(
+                    "audio_head: bs=%d exceeds graph ladder cap %d; running "
+                    "eager (further occurrences suppressed)",
+                    bs,
+                    self._graph_max_bs,
+                )
+            return self._decode_loop(hidden_state)
+        graph = self._graphs.get(bucket)
         if graph is None:
             # Warm up on a side stream, then capture (standard PyTorch recipe).
-            static_in = hidden_state.clone()
+            static_in = torch.zeros(
+                bucket,
+                hidden_state.shape[1],
+                dtype=hidden_state.dtype,
+                device=hidden_state.device,
+            )
             side = torch.cuda.Stream()
             side.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side):
@@ -365,32 +430,27 @@ class LongcatNextAudioHead(nn.Module):
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 static_out = self._decode_loop(static_in)
-            self._graphs[bs] = graph
-            self._graph_in[bs] = static_in
-            self._graph_out[bs] = static_out
+            self._graphs[bucket] = graph
+            self._graph_in[bucket] = static_in
+            self._graph_out[bucket] = static_out
 
-        self._graph_in[bs].copy_(hidden_state)
+        static_in = self._graph_in[bucket]
+        static_in[bs:].zero_()
+        static_in[:bs].copy_(hidden_state)
         graph.replay()
         # Clone so callers own the result independent of the static buffer.
-        return self._graph_out[bs].clone()
+        return self._graph_out[bucket][:bs].clone()
 
     @torch.no_grad()
-    def forward(
-        self,
-        hidden_state: torch.Tensor,
-        prev_audio_codes: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         """Run the 8-step causal codebook prediction loop.
 
         Args:
             hidden_state: LLM last-layer output  ``[B, hidden_size]``.
-            prev_audio_codes: unused (kept for API compatibility); the loop is
-                self-contained given ``hidden_state`` thanks to causal masking.
 
         Returns:
             Predicted codes  ``[B, num_codebooks]`` (int64, on the same device).
         """
-        del prev_audio_codes
         if self._graph_enabled and hidden_state.is_cuda:
             return self._decode_loop_graphed(hidden_state)
         return self._decode_loop(hidden_state)

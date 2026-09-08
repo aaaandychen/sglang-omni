@@ -3,17 +3,31 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import Any
 
 import torch
 
 from sglang_omni.model_runner.base import ModelRunner
-from sglang_omni.models.longcat_next.payload_types import longcat_log_timing, longcat_timing
+from sglang_omni.models.longcat_next.payload_types import (
+    longcat_log_timing,
+    longcat_timing,
+)
+
+logger = logging.getLogger(__name__)
 
 # ── Phase 3: audio generation special tokens ──────────────────────────────
 # From config.json → audio_config.
 _AUDIOGEN_START_TOKEN_ID: int = 131123
 _AUDIOGEN_END_TOKEN_ID: int = 131124
+
+# Phase 4 debug knob: ``non_blocking=True`` H2D only truly overlaps when the
+# source is pinned host memory (i.e. served from the offloaded encoder cache).
+# With SGLANG_OMNI_LONGCAT_DEBUG_PINNED=1, pageable sources are logged (once
+# per modality) instead of silently degrading to a synchronous copy.
+_DEBUG_PINNED = os.getenv("SGLANG_OMNI_LONGCAT_DEBUG_PINNED", "0") == "1"
+_logged_unpinned_modalities: set[str] = set()
 
 
 class LongcatNextModelRunner(ModelRunner):
@@ -100,6 +114,19 @@ class LongcatNextModelRunner(ModelRunner):
                         f"need {selected_count}, got {int(chunk.shape[0])}"
                     )
                 local_positions = selected_positions - chunk_global_start + int(batch_start)
+                if (
+                    _DEBUG_PINNED
+                    and chunk.device.type == "cpu"
+                    and not chunk.is_pinned()
+                    and key not in _logged_unpinned_modalities
+                ):
+                    _logged_unpinned_modalities.add(key)
+                    logger.info(
+                        "LongCat-Next %s embeds are pageable host memory; "
+                        "non_blocking H2D degrades to a synchronous copy "
+                        "(enable pinned encoder-cache offload for overlap)",
+                        key,
+                    )
                 # non_blocking lets a pinned (offloaded) source H2D overlap; no-op otherwise.
                 replace_embeds_parts.append(chunk.to(device=device, non_blocking=True))
                 replace_positions_parts.append(

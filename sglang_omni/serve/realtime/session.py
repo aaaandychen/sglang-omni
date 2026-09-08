@@ -144,6 +144,9 @@ class RealtimeSession:
         # P3: transcription runs off the TTFA critical path as a background
         # task. Tracked so teardown can cancel any still-running transcribe.
         self._bg_tasks: set[asyncio.Task] = set()
+        # Partial reply text stashed by run_response when a barge-in cancels
+        # it mid-stream; consumed by run_turn's finally for history fidelity.
+        self._partial_response_text = ""
         # P5 (optional, env-gated): streaming ASR — emit partial transcripts of
         # the CURRENT utterance while the user is still speaking, purely for UI
         # (does not feed the response). Off by default; extra ASR compute.
@@ -291,11 +294,28 @@ class RealtimeSession:
             # abort itself is done in the background. The next turn waits on
             # ``self._pending_abort`` (barrier in drain_queue) so new/old reqs
             # don't race for KV.
+            #
+            # Ordering: the background abort task is created BEFORE the first
+            # await below. If it were created after ``send(...)``, the yield
+            # could let drain_queue pick up a queued utterance and start its
+            # engine request while the previous one is still alive (KV race).
+            #
+            # Queue semantics on barge-in: utterances already committed into
+            # ``response_queue`` are kept, not dropped — they are complete user
+            # speech, and discarding them would lose context (violating the
+            # interrupt-fidelity goal). The drainer answers them in FIFO order
+            # once the abort barrier clears.
             self.utterance_start_byte = min(
                 max(0, emit.sample_offset * 2), self.audio_buffer.num_bytes
             )
             self.utterance_item_id = new_id("item")
             barge = self.active_task is not None and not self.active_task.done()
+            if barge:
+                # P0: abort previous response in background (do not block).
+                prev_task, prev_rid = self.active_task, self.active_request_id
+                self._pending_abort = asyncio.create_task(
+                    self._cancel_and_abort(prev_task, prev_rid)
+                )
             await self.send(
                 make_event(
                     "input_audio_buffer.speech_started",
@@ -310,11 +330,6 @@ class RealtimeSession:
                         "response.audio.flush",
                         reason="barge_in",
                     )
-                )
-                # P0: abort previous response in background (do not block).
-                prev_task, prev_rid = self.active_task, self.active_request_id
-                self._pending_abort = asyncio.create_task(
-                    self._cancel_and_abort(prev_task, prev_rid)
                 )
                 if _TIMING:
                     logger.info("[realtime-timing] barge_in_signal_sent")
@@ -386,6 +401,8 @@ class RealtimeSession:
         item BEFORE the assistant reply; the background transcription fills its
         text in place. Pending items are skipped by request-building until
         filled, so a not-yet-transcribed turn never corrupts the next prompt.
+        Transcription is scheduled from ``finally``, so a barge-in cancel still
+        preserves the user's words (and the slot never stays pending).
         """
         # Reserve the user slot first (spoke first), then the assistant slot.
         user_item = ConversationItem(role="user", text="", pending=True)
@@ -394,16 +411,33 @@ class RealtimeSession:
         try:
             response_text = await self.run_response(audio_payload)
         finally:
+            # On barge-in, run_response stashes the already-streamed partial
+            # reply before re-raising; record whichever form we have so the
+            # interrupted turn is not silently dropped from history.
+            if not response_text:
+                response_text = self._partial_response_text
+            self._partial_response_text = ""
             if response_text:
                 self.conversation.append(
                     ConversationItem(role="assistant", text=response_text)
                 )
-        # P3: transcription off the critical path — next turn can start now.
-        task = asyncio.create_task(
-            self._background_transcribe(item_id, audio_payload, user_item)
-        )
-        self._bg_tasks.add(task)
-        task.add_done_callback(self._bg_tasks.discard)
+            # Barge-in safety: the user DID finish this utterance even when the
+            # response was cancelled mid-stream, so the transcription task is
+            # scheduled from ``finally`` — otherwise a cancelled turn would
+            # leave the reserved slot pending forever and silently drop the
+            # user's words from all future prompts (P1 fix).
+            if not self.closed:
+                # P3: transcription off the critical path — next turn can
+                # start now.
+                task = asyncio.create_task(
+                    self._background_transcribe(item_id, audio_payload, user_item)
+                )
+                self._bg_tasks.add(task)
+                task.add_done_callback(self._bg_tasks.discard)
+            else:
+                # Tearing down: no new engine work; just release the slot so a
+                # final prompt build never waits on it.
+                user_item.pending = False
 
     async def _background_transcribe(
         self, item_id: str, audio_payload: str, user_item: ConversationItem
@@ -430,6 +464,7 @@ class RealtimeSession:
         self.active_request_id = request_id
         turn_start_ms = _now_ms()
         first_audio_logged = False
+        text_acc: list[str] = []
 
         try:
             await self.send(
@@ -445,7 +480,6 @@ class RealtimeSession:
             )
 
             resp_item_id = new_id("item")
-            text_acc: list[str] = []
             audio_emitted = False
             finish_reason = "stop"
             usage: dict[str, Any] | None = None
@@ -513,7 +547,18 @@ class RealtimeSession:
             )
             content = [{"type": "text", "text": response_text}]
             if audio_emitted:
-                content.append({"type": "audio", "transcript": response_text})
+                content.append(
+                    {
+                        "type": "audio",
+                        # The audio bytes were already streamed via
+                        # ``response.audio.delta``; an empty ``audio`` field
+                        # keeps the OpenAI Realtime item contract (audio +
+                        # transcript present on the done item) without
+                        # duplicating the payload.
+                        "audio": "",
+                        "transcript": response_text,
+                    }
+                )
             await self.send(
                 make_event(
                     "response.done",
@@ -536,14 +581,25 @@ class RealtimeSession:
                 )
             )
             return response_text
+        except asyncio.CancelledError:
+            # Barge-in: stash whatever the user already heard so run_turn's
+            # finally can still record the partial reply in history instead of
+            # dropping the whole turn.
+            self._partial_response_text = "".join(text_acc)
+            raise
         finally:
             self.active_request_id = None
 
     async def run_transcription(self, item_id: str, audio_payload: str) -> str:
+        # Background pass: deliberately does NOT touch
+        # ``self.active_request_id`` — that slot belongs to the user-facing
+        # response pass. Clobbering it from this off-path task would make a
+        # later barge-in abort the wrong engine request (the transcription
+        # instead of the live response). Cancellation aborts our own engine
+        # request directly instead.
         request_id = f"rt-{self.session_id}-{uuid.uuid4().hex}"
-        self.active_request_id = request_id
+        text_acc: list[str] = []
         try:
-            text_acc: list[str] = []
             async for chunk in self.client.completion_stream(
                 self.build_transcription_request(audio_payload),
                 request_id=request_id,
@@ -560,19 +616,22 @@ class RealtimeSession:
                     )
                 if chunk.finish_reason is not None:
                     break
+        except asyncio.CancelledError:
+            # Release the engine-side request so it cannot linger after the
+            # session dropped this background pass.
+            await self.client.abort(request_id)
+            raise
 
-            transcript = "".join(text_acc)
-            await self.send(
-                make_event(
-                    "conversation.item.input_audio_transcription.completed",
-                    item_id=item_id,
-                    content_index=0,
-                    transcript=transcript,
-                )
+        transcript = "".join(text_acc)
+        await self.send(
+            make_event(
+                "conversation.item.input_audio_transcription.completed",
+                item_id=item_id,
+                content_index=0,
+                transcript=transcript,
             )
-            return transcript
-        finally:
-            self.active_request_id = None
+        )
+        return transcript
 
     def _sampling(self) -> SamplingParams:
         max_tokens = self.session_object.max_response_output_tokens
